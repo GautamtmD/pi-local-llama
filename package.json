@@ -1,0 +1,21 @@
+{
+  "name": "pi-local-llama",
+  "version": "0.1.0",
+  "description": "Pi extension that auto-detects OpenAI-compatible local LLM servers and registers their models.",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "typebox": "^1.1.38",
+    "typescript": "^7.0.2"
+  }
+}

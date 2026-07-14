@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "pollIntervalMs": 5000,
+  "timeoutMs": 3000,
+  "notify": true,
+  "status": true,
+  "discoverAtStartup": true,
+  "autoScopePattern": true,
+  "scopeSettings": "global",
+  "scopePattern": "local-*/*",
+  "servers": [
+    "http://localhost:1234/v1",
+
+    {
+      "baseUrl": "http://localhost:11434/v1",
+      "apiKey": "ollama",
+      "name": "ollama",
+      "provider": "local-ollama"
+    },
+
+    {
+      "baseUrl": "http://localhost:8000/v1",
+      "name": "vllm",
+      "provider": "local-vllm",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "maxTokensField": "max_tokens"
+      }
+    }
+  ]
+}
