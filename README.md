@@ -8,9 +8,13 @@ A [Pi](https://pi.dev) extension that **auto-detects OpenAI-compatible local LLM
 - Polls each server's `<baseUrl>/models` endpoint (OpenAI-compatible).
 - When a server is reachable, registers a provider so its models appear in
   `/model` and `/scoped-models`.
-- When the available model list changes, re-registers to keep it in sync.
+- When the available model list **or a model's live context window** changes,
+  re-registers to keep it in sync.
 - When a server is killed / unreachable, unregisters its provider so the
   models disappear.
+- Detects each server's **real running context size** (not a fixed 128k) by
+  probing llama-server's `/props` and `/slots` endpoints — see
+  [Context window detection](#context-window-detection).
 - Shows a footer status line and notifies on state transitions.
 
 ## About "scoped models" and the Ctrl+P pattern
@@ -179,6 +183,37 @@ API. Safe defaults (`supportsDeveloperRole: false`, `supportsReasoningEffort:
 false`) are applied automatically. For servers that reject
 `max_completion_tokens`, add `"maxTokensField": "max_tokens"`.
 
+## Context window detection
+
+Pi needs a model's context window so it knows how much it can fit in one
+request. A fixed default (128k) is wrong for local servers: llama-server's
+actual context is whatever you launched it with (`-c`), and that varies with
+VRAM, model size, and what else is using the GPU. So the extension detects the
+**live** value per server, in this precedence:
+
+1. **llama-server `/props`** → `default_generation_settings.n_ctx` (the
+   per-slot running context — exactly what one request can use). Falls back to
+   top-level `n_ctx` / `n_ctx_per_slot` on newer builds.
+2. **llama-server `/slots`** → the max per-slot `n_ctx`.
+3. **The model's own fields** from `/v1/models`: `meta.n_ctx`, then
+   `context_window`, then `context_length`.
+4. A 128k default — only if nothing above reported a value.
+
+For plain llama-server, step 1 or 2 always wins, so the reported size matches
+your `-c` flag (divided across `-np` parallel slots). The model's
+`meta.n_ctx_train` (the architectural/training max) is deliberately **not**
+used — that's the ceiling the model was trained on, not what this server can do
+right now.
+
+If you relaunch the server with a different `-c` while pi is running, the next
+poll detects the change and re-registers with the new size (no `/reload`
+needed).
+
+Servers that don't expose `/props` or `/slots` (e.g. plain Ollama, some vLLM
+builds) fall through to per-model fields or the default. (Ollama in particular
+sets context per request via `num_ctx`, so a single server-wide number isn't
+meaningful there.)
+
 ## How it works / lifecycle
 
 - **Startup:** an `async` extension factory does a one-time, parallel discovery
@@ -188,8 +223,8 @@ false`) are applied automatically. For servers that reject
 - **Per session (`session_start`):** merges project-local config, reconciles
   state once, then starts a polling `setInterval`.
 - **Polling:** on each tick it registers providers for newly-reachable servers
-  (or when their model list changed) and unregisters providers for servers that
-  became unreachable.
+  (or when their model list **or live context window** changed) and unregisters
+  providers for servers that became unreachable.
 - **Shutdown (`session_shutdown`):** clears the interval. Providers are *left
   registered* — "model removed when server is killed" is handled by
   reachability polling, not by session end, so switching sessions won't yank

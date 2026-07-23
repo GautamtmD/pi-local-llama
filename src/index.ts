@@ -8,8 +8,11 @@
  *   - Polls each server's `<baseUrl>/models` endpoint.
  *   - When a server is reachable, registers a provider so its models appear in
  *     `/model` and `/scoped-models`.
- *   - When the model list changes, re-registers to keep it up to date.
+ *   - When the model list OR a model's live context window changes, re-registers
+ *     to keep it up to date.
  *   - When a server is killed / unreachable, unregisters its provider.
+ *   - Detects each server's real running context size (not a fixed 128k) by
+ *     probing llama-server's `/props` and `/slots` (see resolveContextWindow).
  *   - Optionally manages a scope pattern (see SCOPE_PATTERN) in `settings.json`
  *     (`enabledModels`) so detected models join Ctrl+P cycling.
  *
@@ -57,6 +60,12 @@ const PROVIDER_PREFIX = "local-";
  * `${provider}/${id}` references like `local-localhost-1234/llama3.1:8b`.
  */
 const SCOPE_PATTERN = "local-*/*";
+/**
+ * Fallback context window (tokens) used only when neither the server nor the
+ * model payload reports one. llama-server reports the live value via /props,
+ * /slots, or the model's `meta.n_ctx`, so this default is rarely hit there.
+ */
+const DEFAULT_CONTEXT_WINDOW = 128000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -99,6 +108,7 @@ interface NormalizedServer extends ServerConfig {
 interface RegisteredEntry {
 	server: NormalizedServer;
 	modelIdsKey: string; // sorted, newline-joined model ids; "" if none
+	signature: string; // ids + contextWindow + maxTokens; change triggers re-register
 }
 
 interface RawModel {
@@ -524,7 +534,97 @@ async function discoverModels(server: NormalizedServer, timeoutMs: number): Prom
 	}
 }
 
-function toModelDefinition(raw: RawModel, server: NormalizedServer) {
+/**
+ * Best-effort GET that returns parsed JSON, or null on any failure (network
+ * error, non-2xx, or unparseable body). Used for optional llama-server probes
+ * where a missing endpoint is normal and must NOT surface as an error.
+ */
+async function getJson(url: string, timeoutMs: number, apiKey?: string): Promise<unknown | null> {
+	try {
+		const headers: Record<string, string> = { accept: "application/json" };
+		if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+		const res = await fetchWithTimeout(url, { method: "GET", headers }, timeoutMs);
+		if (!res.ok) return null;
+		return await res.json().catch(() => null);
+	} catch {
+		return null;
+	}
+}
+
+function readPositiveInt(v: unknown): number | undefined {
+	return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : undefined;
+}
+
+/** Pull the per-slot running context out of llama-server's /props payload. */
+function ctxFromProps(props: unknown): number | undefined {
+	if (!props || typeof props !== "object") return undefined;
+	const o = props as Record<string, unknown>;
+	const dgs = o.default_generation_settings;
+	if (dgs && typeof dgs === "object") {
+		const n = readPositiveInt((dgs as Record<string, unknown>).n_ctx);
+		if (n) return n;
+	}
+	// Alternate / newer top-level fields.
+	return readPositiveInt(o.n_ctx_per_slot) ?? readPositiveInt(o.n_ctx);
+}
+
+/** Pull the per-slot running context out of llama-server's /slots payload (max across slots). */
+function ctxFromSlots(slots: unknown): number | undefined {
+	if (!Array.isArray(slots)) return undefined;
+	let max: number | undefined;
+	for (const s of slots) {
+		if (s && typeof s === "object") {
+			const n = readPositiveInt((s as Record<string, unknown>).n_ctx);
+			if (n !== undefined) max = max === undefined ? n : Math.max(max, n);
+		}
+	}
+	return max;
+}
+
+/**
+ * Discover the LIVE context window for a server — the value it was actually
+ * launched with (llama-server's `-c`, divided across slots), reflecting real
+ * VRAM / launch constraints rather than the model's architectural max.
+ *
+ * Probes, in order: llama-server `/props` (`default_generation_settings.n_ctx`,
+ * or top-level `n_ctx` / `n_ctx_per_slot`), then `/slots` (per-slot `n_ctx`).
+ * Returns undefined for servers that expose neither (e.g. plain Ollama, vLLM
+ * without these endpoints) — callers then fall back to per-model fields.
+ */
+async function discoverServerContext(
+	server: NormalizedServer,
+	timeoutMs: number,
+): Promise<number | undefined> {
+	const fromProps = ctxFromProps(await getJson(`${server.baseUrl}/props`, timeoutMs, server.apiKey));
+	if (fromProps) return fromProps;
+	return ctxFromSlots(await getJson(`${server.baseUrl}/slots`, timeoutMs, server.apiKey));
+}
+
+/** Read llama-server's `meta.n_ctx` (running context) from a /v1/models entry. */
+function metaNctx(meta: unknown): number {
+	if (meta && typeof meta === "object") {
+		return readPositiveInt((meta as Record<string, unknown>).n_ctx) ?? 0;
+	}
+	return 0;
+}
+
+/**
+ * Resolve a model's context window, preferring the most authoritative LIVE
+ * source: server-level running context (per-slot, from /props or /slots), then
+ * the model payload's own fields (`meta.n_ctx`, `context_window`,
+ * `context_length`), then a sane default.
+ */
+function resolveContextWindow(raw: RawModel, serverCtx: number | undefined): number {
+	if (serverCtx && serverCtx > 0) return serverCtx;
+	const fromModel =
+		metaNctx(raw.meta) ||
+		readPositiveInt(raw.context_window) ||
+		readPositiveInt(raw.context_length) ||
+		0;
+	return fromModel > 0 ? fromModel : DEFAULT_CONTEXT_WINDOW;
+}
+
+function toModelDefinition(raw: RawModel, server: NormalizedServer, serverCtx: number | undefined) {
 	const id = String(raw.id ?? raw.name ?? "").trim();
 	const name = String(raw.name ?? id);
 	const input = server.input ?? ["text"];
@@ -534,7 +634,7 @@ function toModelDefinition(raw: RawModel, server: NormalizedServer) {
 		reasoning: false,
 		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: num(raw.context_window ?? raw.context_length, 128000),
+		contextWindow: resolveContextWindow(raw, serverCtx),
 		maxTokens: num(raw.max_tokens, 8192),
 		compat: {
 			// Safe defaults for OpenAI-compatible local servers (Ollama, vLLM,
@@ -546,13 +646,17 @@ function toModelDefinition(raw: RawModel, server: NormalizedServer) {
 	};
 }
 
-function buildProviderConfig(server: NormalizedServer, models: RawModel[]) {
+function buildProviderConfig(
+	server: NormalizedServer,
+	models: RawModel[],
+	serverCtx: number | undefined,
+) {
 	return {
 		name: server.displayName,
 		baseUrl: server.baseUrl,
 		apiKey: server.apiKey ?? "local", // local servers ignore it, but pi needs *some* auth
 		api: "openai-completions" as const,
-		models: models.map((m) => toModelDefinition(m, server)),
+		models: models.map((m) => toModelDefinition(m, server, serverCtx)),
 	};
 }
 
@@ -562,6 +666,20 @@ function modelIdsKey(models: RawModel[]): string {
 		.filter(Boolean)
 		.sort()
 		.join("\n");
+}
+
+/**
+ * Stable signature of the provider config we would register: sorted
+ * `id:contextWindow:maxTokens` per model. Compared across polls so we
+ * re-register not just when the model id set changes, but also when a server's
+ * live context window changes (e.g. llama-server relaunched with a different
+ * `-c`, or a model's reported context changed). Without this, pi would keep a
+ * stale contextWindow after a relaunch because the model ids are unchanged.
+ */
+function providerSignature(
+	models: { id: string; contextWindow: number; maxTokens: number }[],
+): string {
+	return models.map((m) => `${m.id}:${m.contextWindow}:${m.maxTokens}`).sort().join("|");
 }
 
 // ---------------------------------------------------------------------------
@@ -593,24 +711,38 @@ async function refresh(
 
 	const normalized = config.servers.map(normalizeServer);
 	const results = await Promise.all(
-		normalized.map(async (server) => ({ server, result: await discoverModels(server, config.timeoutMs) })),
+		normalized.map(async (server) => {
+			// Fetch the model list and the live server context (llama-server's
+			// /props or /slots) in parallel. serverCtx is best-effort: it is
+			// undefined for servers that don't expose those endpoints.
+			const [result, serverCtx] = await Promise.all([
+				discoverModels(server, config.timeoutMs),
+				discoverServerContext(server, config.timeoutMs),
+			]);
+			return { server, result, serverCtx };
+		}),
 	);
 
 	const seen = new Set<string>();
 
-	for (const { server, result } of results) {
+	for (const { server, result, serverCtx } of results) {
 		seen.add(server.providerName);
 
 		if (result.ok) {
-			const key = modelIdsKey(result.models);
+			const providerConfig = buildProviderConfig(server, result.models, serverCtx);
+			const signature = providerSignature(providerConfig.models);
+			const idsKey = modelIdsKey(result.models);
 			const prev = registered.get(server.providerName);
 			if (!prev) {
-				pi.registerProvider(server.providerName, buildProviderConfig(server, result.models));
-				registered.set(server.providerName, { server, modelIdsKey: key });
+				pi.registerProvider(server.providerName, providerConfig);
+				registered.set(server.providerName, { server, modelIdsKey: idsKey, signature });
 				summary.added.push(server);
-			} else if (prev.modelIdsKey !== key) {
-				pi.registerProvider(server.providerName, buildProviderConfig(server, result.models));
-				registered.set(server.providerName, { server, modelIdsKey: key });
+			} else if (prev.signature !== signature) {
+				// Model set OR per-model fields (context window, max tokens)
+				// changed since last poll — re-register to keep pi in sync.
+				// This also covers relaunching llama-server with a different -c.
+				pi.registerProvider(server.providerName, providerConfig);
+				registered.set(server.providerName, { server, modelIdsKey: idsKey, signature });
 				summary.changed.push(server);
 			}
 			summary.up.push({ server, count: result.models.length });
