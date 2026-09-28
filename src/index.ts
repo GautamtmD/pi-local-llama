@@ -5,11 +5,18 @@
  * llama.cpp, SGLang, etc.) and registers their models with pi.
  *
  *   - Reads a list of server base URLs from config.
- *   - Polls each server's `<baseUrl>/models` endpoint.
+ *   - Polls each server's `<baseUrl>/models` endpoint, reporting 401/403 as
+ *     authentication required or rejected rather than an unreachable server.
+ *   - Stores keys entered with `/local-llama-servers key <url>` in a separate,
+ *     agent-global `local-llama-credentials.json` (plaintext, private where
+ *     supported); reuses them for discovery and inference. Explicit `apiKey`
+ *     in server config takes precedence. Pi's input dialog may show the key.
+ *     `/local-llama-servers key-remove <url>` removes the saved key.
+ *   - Warns on missing or rejected keys (401/403) without repeating every poll.
  *   - When a server is reachable, registers a provider so its models appear in
  *     `/model` and `/scoped-models`.
- *   - When the model list OR a model's live context window changes, re-registers
- *     to keep it up to date.
+ *   - When the model list, a model's live context window, OR the key changes,
+ *     re-registers to keep the provider up to date.
  *   - When a server is killed / unreachable, unregisters its provider.
  *   - Detects each server's real running context size (not a fixed 128k) by
  *     probing llama-server's `/props` and `/slots` (see resolveContextWindow).
@@ -30,6 +37,7 @@
  *
  * Commands:
  *   /local-llama-servers add|remove|list [url] [--project]  (server list)
+ *   /local-llama-servers key|key-remove <url>             (saved API keys)
  *   /local-llama-scope   enable|disable|status              (Ctrl+P pattern)
  *   /local-llama-rescan                                     (rescan now)
  *
@@ -40,7 +48,8 @@
  * `pi remove`, since the extension can no longer run after it is uninstalled.
  */
 
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
 	CONFIG_DIR_NAME,
@@ -109,6 +118,7 @@ interface RegisteredEntry {
 	server: NormalizedServer;
 	modelIdsKey: string; // sorted, newline-joined model ids; "" if none
 	signature: string; // ids + contextWindow + maxTokens; change triggers re-register
+	apiKey: string; // compare in memory so key replacement refreshes inference credentials
 }
 
 interface RawModel {
@@ -127,6 +137,7 @@ interface DiscoverOk {
 interface DiscoverFail {
 	ok: false;
 	error: string;
+	auth?: "missing" | "rejected";
 }
 type DiscoverResult = DiscoverOk | DiscoverFail;
 
@@ -136,6 +147,7 @@ interface RefreshSummary {
 	removed: { server: NormalizedServer; reason: string }[];
 	up: { server: NormalizedServer; count: number }[];
 	down: { server: NormalizedServer; error: string }[];
+	auth: { server: NormalizedServer; kind: "missing" | "rejected" }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +313,68 @@ async function computeConfig(ctx: { cwd: string; isProjectTrusted(): boolean }):
 	let cfg = mergeConfigs(await loadGlobalConfig(), loadEnvConfig());
 	if (ctx.isProjectTrusted()) cfg = mergeConfigs(cfg, await loadProjectConfig(ctx.cwd));
 	return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// Saved API keys (agent-global, never stored in project config by the command)
+// ---------------------------------------------------------------------------
+
+function credentialsPath(): string {
+	return join(getAgentDir(), "local-llama-credentials.json");
+}
+
+/** Return null for a broken/unreadable store so commands never overwrite it. */
+async function readCredentials(): Promise<Record<string, string> | null> {
+	const path = credentialsPath();
+	let text: string;
+	try {
+		text = await readFile(path, "utf8");
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return {};
+		console.error(`[pi-local-llama] failed to read ${path}: ${errMsg(e)}`);
+		return null;
+	}
+	let raw: unknown;
+	try {
+		raw = JSON.parse(text);
+	} catch {
+		// SyntaxError messages can include fragments of the secret file.
+		console.error(`[pi-local-llama] invalid JSON in ${path}; leaving it untouched`);
+		return null;
+	}
+	if (!raw || typeof raw !== "object" || Array.isArray(raw) ||
+		Object.values(raw).some((v) => typeof v !== "string")) {
+		console.error(`[pi-local-llama] ${path} is not a URL-to-key JSON object; leaving it untouched`);
+		return null;
+	}
+	return raw as Record<string, string>;
+}
+
+/** Write a private, uniquely named temp file then atomically replace the store. */
+async function writeCredentials(keys: Record<string, string>): Promise<void> {
+	const path = credentialsPath();
+	const tmp = `${path}.${randomUUID()}.tmp`;
+	try {
+		await writeFile(tmp, `${JSON.stringify(keys, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+		await rename(tmp, path);
+	} finally {
+		await unlink(tmp).catch((e: NodeJS.ErrnoException) => {
+			if (e.code !== "ENOENT") console.error(`[pi-local-llama] failed to remove ${tmp}: ${errMsg(e)}`);
+		});
+	}
+}
+
+async function updateCredential(baseUrl: string, key: string | undefined): Promise<void> {
+	const keys = await readCredentials();
+	if (!keys) throw new Error(`credentials file is unreadable: ${credentialsPath()}`);
+	if (key === undefined) delete keys[baseUrl];
+	else keys[baseUrl] = key;
+	await writeCredentials(keys);
+}
+
+/** An explicit per-server key takes precedence over a saved key. */
+function withCredential(server: ServerConfig, keys: Record<string, string>): ServerConfig {
+	return { ...server, apiKey: server.apiKey?.trim() || keys[server.baseUrl] || undefined };
 }
 
 // ---------------------------------------------------------------------------
@@ -513,7 +587,12 @@ async function discoverModels(server: NormalizedServer, timeoutMs: number): Prom
 		if (server.apiKey) headers.authorization = `Bearer ${server.apiKey}`;
 
 		const res = await fetchWithTimeout(server.modelsUrl, { method: "GET", headers }, timeoutMs);
-		if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+		if (!res.ok) return {
+			ok: false,
+			error: `HTTP ${res.status}`,
+			auth: res.status === 401 || res.status === 403
+				? (server.apiKey ? "rejected" : "missing") : undefined,
+		};
 
 		const json: unknown = await res.json().catch(() => null);
 		let list: unknown[] = [];
@@ -699,6 +778,7 @@ async function refresh(
 	pi: ExtensionAPI,
 	config: Config,
 	registered: Map<string, RegisteredEntry>,
+	authStates: Map<string, "missing" | "rejected">,
 	ctx?: CtxLike,
 ): Promise<RefreshSummary> {
 	const summary: RefreshSummary = {
@@ -707,9 +787,11 @@ async function refresh(
 		removed: [],
 		up: [],
 		down: [],
+		auth: [],
 	};
 
-	const normalized = config.servers.map(normalizeServer);
+	const keys = await readCredentials();
+	const normalized = config.servers.map((s) => normalizeServer(withCredential(s, keys ?? {})));
 	const results = await Promise.all(
 		normalized.map(async (server) => {
 			// Fetch the model list and the live server context (llama-server's
@@ -735,25 +817,31 @@ async function refresh(
 			const prev = registered.get(server.providerName);
 			if (!prev) {
 				pi.registerProvider(server.providerName, providerConfig);
-				registered.set(server.providerName, { server, modelIdsKey: idsKey, signature });
+				registered.set(server.providerName, { server, modelIdsKey: idsKey, signature, apiKey: providerConfig.apiKey });
 				summary.added.push(server);
-			} else if (prev.signature !== signature) {
+			} else if (prev.signature !== signature || prev.apiKey !== providerConfig.apiKey) {
 				// Model set OR per-model fields (context window, max tokens)
 				// changed since last poll — re-register to keep pi in sync.
 				// This also covers relaunching llama-server with a different -c.
 				pi.registerProvider(server.providerName, providerConfig);
-				registered.set(server.providerName, { server, modelIdsKey: idsKey, signature });
+				registered.set(server.providerName, { server, modelIdsKey: idsKey, signature, apiKey: providerConfig.apiKey });
 				summary.changed.push(server);
 			}
+			authStates.delete(server.providerName);
 			summary.up.push({ server, count: result.models.length });
 		} else {
 			const prev = registered.get(server.providerName);
 			if (prev) {
 				pi.unregisterProvider(server.providerName);
 				registered.delete(server.providerName);
-				summary.removed.push({ server, reason: result.error });
+				summary.removed.push({ server, reason: result.auth === "missing" ? "API key required" : result.auth === "rejected" ? "API key rejected" : result.error });
 			}
-			summary.down.push({ server, error: result.error });
+			if (result.auth) {
+				summary.auth.push({ server, kind: result.auth });
+			} else {
+				authStates.delete(server.providerName);
+				summary.down.push({ server, error: result.error });
+			}
 		}
 	}
 
@@ -765,14 +853,20 @@ async function refresh(
 			summary.removed.push({ server: entry.server, reason: "removed from config" });
 		}
 	}
+	for (const name of authStates.keys()) if (!seen.has(name)) authStates.delete(name);
 
-	emitNotifications(ctx, config, summary);
+	emitNotifications(ctx, config, summary, authStates);
 	emitStatus(ctx, config, summary, registered);
 
 	return summary;
 }
 
-function emitNotifications(ctx: CtxLike | undefined, config: Config, summary: RefreshSummary): void {
+function emitNotifications(
+	ctx: CtxLike | undefined,
+	config: Config,
+	summary: RefreshSummary,
+	authStates: Map<string, "missing" | "rejected">,
+): void {
 	if (!config.notify || !ctx?.hasUI || !ctx.ui?.notify) return;
 
 	const lines: string[] = [];
@@ -783,12 +877,19 @@ function emitNotifications(ctx: CtxLike | undefined, config: Config, summary: Re
 		lines.push(`~ updated: ${summary.changed.map((s) => s.displayName).join(", ")}`);
 	}
 	if (summary.removed.length) {
-		lines.push(`- down: ${summary.removed.map((r) => `${r.server.displayName} [${r.reason}]`).join(", ")}`);
+		lines.push(`- unavailable: ${summary.removed.map((r) => `${r.server.displayName} [${r.reason}]`).join(", ")}`);
+	}
+	const newAuth = summary.auth.filter(({ server, kind }) => authStates.get(server.providerName) !== kind);
+	for (const { server, kind } of summary.auth) authStates.set(server.providerName, kind);
+	for (const { server, kind } of newAuth) {
+		lines.push(kind === "missing"
+			? `${server.displayName} is reachable but requires an API key; use /local-llama-servers key ${server.baseUrl}`
+			: `${server.displayName} rejected its API key; use /local-llama-servers key ${server.baseUrl}`);
 	}
 	if (!lines.length) return;
 
 	const message = `local-llama: ${lines.join("  |  ")}`;
-	const type = summary.removed.length ? "warning" : "info";
+	const type = summary.removed.length || newAuth.length ? "warning" : "info";
 	ctx.ui.notify(message, type);
 }
 
@@ -800,7 +901,7 @@ function emitStatus(
 ): void {
 	if (!config.status || !ctx?.hasUI || !ctx.ui?.setStatus) return;
 
-	if (registered.size === 0 && summary.down.length === 0) {
+	if (registered.size === 0 && summary.down.length === 0 && summary.auth.length === 0) {
 		ctx.ui.setStatus("local-llama", undefined);
 		return;
 	}
@@ -812,6 +913,10 @@ function emitStatus(
 	const parts: string[] = [];
 	if (registered.size) parts.push(`${registered.size} up (${totalModels} models)`);
 	if (summary.down.length) parts.push(`${summary.down.length} down`);
+	const missing = summary.auth.filter((a) => a.kind === "missing").length;
+	const rejected = summary.auth.length - missing;
+	if (missing) parts.push(`${missing} needs API key`);
+	if (rejected) parts.push(`${rejected} key rejected`);
 	ctx.ui.setStatus("local-llama", `🦙 ${parts.join(", ")}`);
 }
 
@@ -820,10 +925,11 @@ function emitStartupSummary(
 	config: Config,
 	registered: Map<string, RegisteredEntry>,
 	down: { server: NormalizedServer; error: string }[],
+	auth: { server: NormalizedServer; kind: "missing" | "rejected" }[],
 ): void {
 	if (!config.notify || !ctx?.hasUI || !ctx.ui?.notify) return;
 	const entries = [...registered.values()];
-	if (!entries.length && !down.length) return;
+	if (!entries.length && !down.length && !auth.length) return;
 
 	const totalModels = entries.reduce(
 		(acc, e) => acc + e.modelIdsKey.split("\n").filter(Boolean).length,
@@ -832,7 +938,11 @@ function emitStartupSummary(
 	const bits: string[] = [];
 	if (entries.length) bits.push(`${entries.length} server(s) up, ${totalModels} model(s)`);
 	if (down.length) bits.push(`${down.length} down`);
-	ctx.ui.notify(`local-llama: ${bits.join("; ")}`, down.length ? "warning" : "info");
+	const missing = auth.filter((a) => a.kind === "missing").length;
+	const rejected = auth.length - missing;
+	if (missing) bits.push(`${missing} needs API key`);
+	if (rejected) bits.push(`${rejected} key rejected`);
+	ctx.ui.notify(`local-llama: ${bits.join("; ")}`, down.length || auth.length ? "warning" : "info");
 }
 
 // ---------------------------------------------------------------------------
@@ -847,13 +957,21 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 
 	// Providers we currently have registered (process-global ModelRegistry).
 	const registered = new Map<string, RegisteredEntry>();
+	const authStates = new Map<string, "missing" | "rejected">();
+	// A command can rescan while a poll is in flight; apply results in order.
+	let pendingRefresh: Promise<void> = Promise.resolve();
+	function runRefresh(config: Config, ctx?: CtxLike): Promise<RefreshSummary> {
+		const run = pendingRefresh.then(() => refresh(pi, config, registered, authStates, ctx));
+		pendingRefresh = run.then(() => {}, () => {});
+		return run;
+	}
 
 	let timer: ReturnType<typeof setInterval> | undefined;
 
 	// One-time initial discovery so models are available immediately at
 	// startup (and for `pi --list-models`).
 	if (baseConfig.discoverAtStartup && baseConfig.servers.length) {
-		await refresh(pi, baseConfig, registered);
+		await runRefresh(baseConfig);
 	}
 
 	pi.on("session_start", async (event, ctx) => {
@@ -884,8 +1002,8 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 		}
 
 		// Immediate reconcile + startup notice.
-		const summary = await refresh(pi, config, registered, ctx);
-		if (ctx.hasUI) emitStartupSummary(ctx, config, registered, summary.down);
+		const summary = await runRefresh(config, ctx);
+		if (ctx.hasUI) emitStartupSummary(ctx, config, registered, summary.down, summary.auth);
 
 		if (timer) clearInterval(timer);
 		if (config.servers.length && config.pollIntervalMs > 0) {
@@ -893,7 +1011,7 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 				try {
 					// Read state.config (not a captured snapshot) so servers added/removed
 					// via /local-llama-servers are picked up by the next poll.
-					await refresh(pi, state.config, registered, ctx);
+					await runRefresh(state.config, ctx);
 				} catch (e) {
 					console.error(`[pi-local-llama] poll error: ${errMsg(e)}`);
 				}
@@ -917,15 +1035,16 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 		description: "Re-scan configured local LLM servers and sync their models.",
 		handler: async (_args, ctx) => {
 			const config = state.config;
-			const summary = await refresh(pi, config, registered, ctx);
+			const summary = await runRefresh(config, ctx);
 			if (!ctx.hasUI) return;
 			if (!config.servers.length) {
 				ctx.ui.notify("local-llama: no servers configured", "warning");
 				return;
 			}
+			const missing = summary.auth.filter((a) => a.kind === "missing").length;
 			ctx.ui.notify(
-				`local-llama: scan complete — ${summary.up.length} up, ${summary.down.length} down`,
-				summary.down.length ? "warning" : "info",
+				`local-llama: scan complete — ${summary.up.length} up, ${summary.down.length} down, ${missing} needs API key, ${summary.auth.length - missing} key rejected`,
+				summary.down.length || summary.auth.length ? "warning" : "info",
 			);
 		},
 	});
@@ -979,7 +1098,7 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 	// Manage the polled server list (persisted to local-llama-servers.json).
 	pi.registerCommand("local-llama-servers", {
 		description:
-			"Manage polled local LLM servers. Usage: /local-llama-servers add|remove|list [url] [--project]",
+			"Manage local servers and keys. Usage: /local-llama-servers add|remove|list [url] [--project], key|key-remove <url>",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) return;
 
@@ -990,6 +1109,10 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 			const sub = (rest[0] ?? "list").toLowerCase();
 			const urlInput = rest.slice(1).join(" ").trim();
 
+			if ((sub === "key" || sub === "key-remove") && projectIdx !== -1) {
+				ctx.ui.notify("local-llama: API keys are saved globally; omit --project.", "warning");
+				return;
+			}
 			if (scope === "project" && !ctx.isProjectTrusted()) {
 				ctx.ui.notify("local-llama: project not trusted; cannot write project config.", "warning");
 				return;
@@ -997,7 +1120,33 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 			const path = serversConfigPath(scope, ctx.cwd);
 
 			try {
-				if (sub === "add") {
+				if (sub === "key" || sub === "key-remove") {
+					const baseUrl = normalizeBaseUrl(urlInput);
+					if (!baseUrl || !state.config.servers.some((s) => s.baseUrl === baseUrl)) {
+						ctx.ui.notify("local-llama: specify a configured server URL (add it first if needed).", "warning");
+						return;
+					}
+					if (sub === "key") {
+						// Pi's built-in input dialog is not guaranteed to mask the key.
+						ctx.ui.notify("local-llama: key entry may be visible while typing; avoid screen sharing.", "warning");
+						const input = await ctx.ui.input(`API key for ${baseUrl}`, "Paste API key (not saved on cancel)");
+						if (input === undefined) return;
+						const key = input.trim();
+						if (!key || /[\r\n]/.test(input)) {
+							ctx.ui.notify("local-llama: API key must be non-empty and single-line.", "warning");
+							return;
+						}
+						await updateCredential(baseUrl, key);
+						ctx.ui.notify(`local-llama: saved API key for ${baseUrl} in ${credentialsPath()}.`, "info");
+					} else {
+						await updateCredential(baseUrl, undefined);
+						ctx.ui.notify(`local-llama: removed saved API key for ${baseUrl}.`, "info");
+					}
+					if (state.config.servers.find((s) => s.baseUrl === baseUrl)?.apiKey) {
+						ctx.ui.notify(`local-llama: ${baseUrl} has an explicit apiKey in server config, which takes precedence.`, "warning");
+					}
+					await runRefresh(state.config, ctx);
+				} else if (sub === "add") {
 					if (!urlInput) {
 						ctx.ui.notify("local-llama: usage: /local-llama-servers add <url> [--project]", "warning");
 						return;
@@ -1006,7 +1155,7 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 					if (res.changed) {
 						ctx.ui.notify(`local-llama: added ${res.baseUrl} to ${path}`, "info");
 						state.config = await computeConfig(ctx);
-						await refresh(pi, state.config, registered, ctx); // notifies up/down
+						await runRefresh(state.config, ctx); // notifies up/down
 					} else {
 						ctx.ui.notify(`local-llama: ${res.baseUrl ?? urlInput} ${res.reason}.`, "info");
 					}
@@ -1019,7 +1168,7 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 					if (res.changed) {
 						ctx.ui.notify(`local-llama: removed ${res.baseUrl} from ${path}`, "info");
 						state.config = await computeConfig(ctx);
-						await refresh(pi, state.config, registered, ctx); // unregisters if needed
+						await runRefresh(state.config, ctx); // unregisters if needed
 					} else {
 						ctx.ui.notify(`local-llama: ${res.baseUrl ?? urlInput} ${res.reason}.`, "info");
 					}
@@ -1031,14 +1180,16 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 					}
 					const lines = entries.map((e) => {
 						const sc = coerceServer(e.raw) ?? { baseUrl: e.url };
-						const up = registered.has(normalizeServer(sc).providerName);
-						return `${up ? "up  " : "down"}  ${e.url}`;
+						const provider = normalizeServer(sc).providerName;
+						const auth = authStates.get(provider);
+						return `${registered.has(provider) ? "up" : auth === "missing" ? "needs API key" : auth === "rejected" ? "key rejected" : "down"}  ${e.url}`;
 					});
 					ctx.ui.notify(`local-llama (${path}):
 ${lines.join("\n")}`, "info");
 				} else {
 					ctx.ui.notify(
-						`local-llama: unknown subcommand "${sub}". Use add, remove, or list.`,
+						`local-llama: unknown subcommand "${sub}". Use add, remove, list, key, or key-remove.`,
+
 						"warning",
 					);
 				}

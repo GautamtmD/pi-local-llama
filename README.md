@@ -157,7 +157,7 @@ cp local-servers.example.json ~/.pi/agent/local-llama-servers.json
     "http://localhost:1234/v1",            // shorthand: just a base URL
     {
       "baseUrl": "http://localhost:11434/v1",
-      "apiKey": "ollama",                  // sent as Authorization: Bearer; local servers usually ignore it
+      "apiKey": "ollama",                  // optional explicit key; prefer the interactive key command for secrets
       "name": "ollama",                    // display name
       "provider": "ollama",            // provider id; always forced to start with `local-` -> `local-ollama`
       "input": ["text", "image"],          // default input types per model
@@ -223,8 +223,9 @@ meaningful there.)
 - **Per session (`session_start`):** merges project-local config, reconciles
   state once, then starts a polling `setInterval`.
 - **Polling:** on each tick it registers providers for newly-reachable servers
-  (or when their model list **or live context window** changed) and unregisters
-  providers for servers that became unreachable.
+  (or when their model list, **live context window**, or API key changed) and
+  unregisters providers for servers that became unreachable or reject auth.
+  Discovery and inference both use the effective key as a Bearer token.
 - **Shutdown (`session_shutdown`):** clears the interval. Providers are *left
   registered* — "model removed when server is killed" is handled by
   reachability polling, not by session end, so switching sessions won't yank
@@ -240,15 +241,29 @@ meaningful there.)
 - `/local-llama-servers remove <url> [--project]` — remove a server (unregisters
   its provider on the next scan).
 - `/local-llama-servers list [--project]` — list configured servers with up/down
-  status.
+  or authentication status.
+- `/local-llama-servers key <url>` — enter or replace a server's API key via a
+  dialog, save it for future sessions, and rescan immediately. The server must
+  already be configured; use the same URL as in `list` (bare `host:port` also
+  works). **The standard Pi input dialog may show the key while typing**; do
+  not use it while screen sharing. Never pass the key as a command argument.
+- `/local-llama-servers key-remove <url>` — delete the saved key and rescan.
+  Key commands always use the agent-global credential store; `--project` is
+  not supported.
 - `/local-llama-rescan` — immediately re-scan all configured servers and sync.
 - `/local-llama-scope enable|disable|status` — manage the `local-*/*` Ctrl+P
   pattern in `settings.json` (the reliable add/remove path; see "Removal /
   uninstall" above).
 
-> `/local-llama-servers` edits `local-llama-servers.json` (the server list);
-> `/local-llama-scope` edits `settings.json` (`enabledModels`). They're separate
-> because they configure different things.
+> `/local-llama-servers add/remove` edits `local-llama-servers.json` (the server
+> list); `key/key-remove` edits `<agentDir>/local-llama-credentials.json` (saved
+> keys). `/local-llama-scope` edits `settings.json` (`enabledModels`).
+>
+> Keys are stored as plaintext in an agent-global file keyed by normalized base
+> URL (independent of project trust), written atomically with owner-only file
+> permissions where supported. Protect backups of this file. An explicit
+> `apiKey` on the effective server config takes precedence over a saved key;
+> remove or change that setting if you want the key command to take effect.
 
 ## Environment variables
 
@@ -258,9 +273,12 @@ meaningful there.)
 
 ## Troubleshooting
 
-- **Models don't appear in `/model`:** local servers ignore the API key, but Pi
-  needs *some* auth before a model is selectable. The extension defaults
-  `apiKey` to `"local"`; you generally don't need to set it.
+- **Models don't appear in `/model`:** for servers requiring Bearer auth, a
+  401/403 from `/models` is shown as **needs API key** (when no key is set) or
+  **key rejected** (when a key was sent), rather than server down. Run
+  `/local-llama-servers key <url>` to enter or replace the key. Warnings appear
+  when this state changes, not on every poll. For servers without auth the
+  extension still supplies Pi's required fallback `apiKey: "local"`.
 - **Server is up but models are empty:** open `<baseUrl>/models` in a browser to
   confirm it returns `{ "data": [{ "id": "..." }, ...] }`.
 - **Startup feels slow:** if all your servers are usually down, set
