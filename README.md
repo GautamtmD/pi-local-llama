@@ -161,6 +161,9 @@ cp local-servers.example.json ~/.pi/agent/local-llama-servers.json
       "name": "ollama",                    // display name
       "provider": "ollama",            // provider id; always forced to start with `local-` -> `local-ollama`
       "input": ["text", "image"],          // default input types per model
+      "reasoning": true,                   // thinking model: enables pi's thinking level (sent as reasoning_effort)
+      "maxTokens": 32768,                  // output cap; overrides the model's max_tokens and the 8192 default
+      "thinkingLevelMap": { "off": "none" }, // pi level -> server value; null hides a level
       "compat": {                          // OpenAI-compat flags (see docs/models.md)
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": false,
@@ -182,6 +185,9 @@ Many OpenAI-compatible local servers don't fully implement the latest OpenAI
 API. Safe defaults (`supportsDeveloperRole: false`, `supportsReasoningEffort:
 false`) are applied automatically. For servers that reject
 `max_completion_tokens`, add `"maxTokensField": "max_tokens"`.
+
+A server marked `"reasoning": true` registers its models as thinking models and
+turns on `supportsReasoningEffort` (an explicit `compat` value still wins).
 
 ## Context window detection
 

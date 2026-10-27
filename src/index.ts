@@ -20,6 +20,8 @@
  *   - When a server is killed / unreachable, unregisters its provider.
  *   - Detects each server's real running context size (not a fixed 128k) by
  *     probing llama-server's `/props` and `/slots` (see resolveContextWindow).
+ *   - Per-server `reasoning`, `maxTokens` and `thinkingLevelMap` options mark
+ *     models as thinking models (sending reasoning_effort) and set output caps.
  *   - Optionally manages a scope pattern (see SCOPE_PATTERN) in `settings.json`
  *     (`enabledModels`) so detected models join Ctrl+P cycling.
  *
@@ -94,6 +96,9 @@ interface ServerConfig {
 	provider?: string; // explicit provider id (will be `local-` prefixed)
 	compat?: ServerCompat; // merged into each model's compat
 	input?: ("text" | "image")[];
+	reasoning?: boolean; // model thinks; enables pi's thinking level (sent as reasoning_effort)
+	maxTokens?: number; // output cap, overrides the model's `max_tokens` and the 8192 default
+	thinkingLevelMap?: Record<string, string | null>; // pi level -> server value; null hides a level
 }
 
 interface Config {
@@ -243,6 +248,13 @@ function coerceServer(entry: unknown): ServerConfig | undefined {
 		if (Array.isArray(obj.input)) {
 			const input = obj.input.filter((x): x is "text" | "image" => x === "text" || x === "image");
 			if (input.length) server.input = input;
+		}
+		if (typeof obj.reasoning === "boolean") server.reasoning = obj.reasoning;
+		if (typeof obj.maxTokens === "number" && Number.isFinite(obj.maxTokens) && obj.maxTokens > 0) {
+			server.maxTokens = Math.floor(obj.maxTokens);
+		}
+		if (obj.thinkingLevelMap && typeof obj.thinkingLevelMap === "object") {
+			server.thinkingLevelMap = { ...(obj.thinkingLevelMap as Record<string, string | null>) };
 		}
 		return server;
 	}
@@ -707,19 +719,22 @@ function toModelDefinition(raw: RawModel, server: NormalizedServer, serverCtx: n
 	const id = String(raw.id ?? raw.name ?? "").trim();
 	const name = String(raw.name ?? id);
 	const input = server.input ?? ["text"];
+	const reasoning = server.reasoning ?? false;
 	return {
 		id,
 		name: name || id,
-		reasoning: false,
+		reasoning,
 		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: resolveContextWindow(raw, serverCtx),
-		maxTokens: num(raw.max_tokens, 8192),
+		maxTokens: server.maxTokens ?? num(raw.max_tokens, 8192),
+		...(server.thinkingLevelMap ? { thinkingLevelMap: server.thinkingLevelMap } : {}),
 		compat: {
 			// Safe defaults for OpenAI-compatible local servers (Ollama, vLLM,
-			// SGLang, llama.cpp, LM Studio). See docs/models.md.
+			// SGLang, llama.cpp, LM Studio). See docs/models.md. A server marked
+			// `reasoning` gets OpenAI-style reasoning_effort unless compat says otherwise.
 			supportsDeveloperRole: false,
-			supportsReasoningEffort: false,
+			supportsReasoningEffort: reasoning,
 			...(server.compat ?? {}),
 		},
 	};
