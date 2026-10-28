@@ -16,6 +16,13 @@ A [Pi](https://pi.dev) extension that **auto-detects OpenAI-compatible local LLM
   probing llama-server's `/props` and `/slots` endpoints — see
   [Context window detection](#context-window-detection).
 - Shows a footer status line and notifies on state transitions.
+- Before each idle prompt, if the selected model is from a local server that no
+  longer serves it (e.g. llama-server relaunched with a different model),
+  **switches to that server's first model alphabetically** and briefly shows
+  `🦙 switched model: old → new` in the footer. Disable with
+  `"autoSwitchModel": false`. Recovers providers removed during a restart
+  before Pi checks authentication, and preserves manual model selections made
+  while the server check is running.
 
 ## About "scoped models" and the Ctrl+P pattern
 
@@ -153,6 +160,7 @@ cp local-servers.example.json ~/.pi/agent/local-llama-servers.json
   "autoScopePattern": true,    // add `scopePattern` to settings.json on first startup (if enabledModels empty)
   "scopeSettings": "global",   // "global" (~/.pi/agent/settings.json) or "project" (.pi/settings.json)
   "scopePattern": "local-*/*", // glob added/removed from settings `enabledModels` for Ctrl+P
+  "autoSwitchModel": true,     // before each prompt, switch off a local model its server no longer serves
   "servers": [
     "http://localhost:1234/v1",            // shorthand: just a base URL
     {
@@ -232,6 +240,14 @@ meaningful there.)
   (or when their model list, **live context window**, or API key changed) and
   unregisters providers for servers that became unreachable or reject auth.
   Discovery and inference both use the effective key as a Bearer token.
+- **Each idle prompt (`input`, before authentication):** looks up the selected
+  local model's server in config and checks `/models` live, even if polling
+  removed the provider during a restart. Re-syncs a recovered provider to
+  restore authentication. If the model id is gone but the server serves
+  others, switches to the first model id alphabetically, with a temporary
+  (10s) footer status. A manual selection made during the check is preserved.
+  Non-local models, unreachable servers, and input queued while the agent is
+  running are left alone.
 - **Shutdown (`session_shutdown`):** clears the interval. Providers are *left
   registered* — "model removed when server is killed" is handled by
   reachability polling, not by session end, so switching sessions won't yank

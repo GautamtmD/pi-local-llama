@@ -8,6 +8,7 @@
   "autoScopePattern": true,
   "scopeSettings": "global",
   "scopePattern": "local-*/*",
+  "autoSwitchModel": true,
   "servers": [
     "http://localhost:1234/v1",
 

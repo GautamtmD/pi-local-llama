@@ -24,6 +24,12 @@
  *     models as thinking models (sending reasoning_effort) and set output caps.
  *   - Optionally manages a scope pattern (see SCOPE_PATTERN) in `settings.json`
  *     (`enabledModels`) so detected models join Ctrl+P cycling.
+ *   - Before each idle prompt (`input`, before authentication), recovers
+ *     configured local providers removed during a server restart. If the
+ *     selected model is no longer served, switches to the server's first
+ *     model alphabetically and shows a temporary footer status
+ *     (`autoSwitchModel`, default on). Preserves manual model selections made
+ *     while checking the server.
  *
  * Every provider registered by this extension is named with the `local-`
  * prefix (e.g. `local-localhost-1234`), so the configured scope glob reliably
@@ -77,6 +83,9 @@ const SCOPE_PATTERN = "local-*/*";
  * /slots, or the model's `meta.n_ctx`, so this default is rarely hit there.
  */
 const DEFAULT_CONTEXT_WINDOW = 128000;
+/** Footer status key and lifetime for the temporary "model switched" message. */
+const SWITCH_STATUS_KEY = "local-llama-switch";
+const SWITCH_STATUS_MS = 10000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -111,6 +120,7 @@ interface Config {
 	autoScopePattern: boolean; // add `scopePattern` to settings on first startup
 	scopeSettings: "global" | "project"; // which settings.json to manage
 	scopePattern: string; // the glob to add/remove (default SCOPE_PATTERN)
+	autoSwitchModel: boolean; // switch off a local model its server no longer serves
 }
 
 interface NormalizedServer extends ServerConfig {
@@ -169,6 +179,7 @@ const DEFAULTS: Config = {
 	autoScopePattern: true,
 	scopeSettings: "global",
 	scopePattern: SCOPE_PATTERN,
+	autoSwitchModel: true,
 };
 
 function errMsg(e: unknown): string {
@@ -272,6 +283,7 @@ function coerceConfig(raw: unknown): Config {
 	if (typeof obj.status === "boolean") cfg.status = obj.status;
 	if (typeof obj.discoverAtStartup === "boolean") cfg.discoverAtStartup = obj.discoverAtStartup;
 	if (typeof obj.autoScopePattern === "boolean") cfg.autoScopePattern = obj.autoScopePattern;
+	if (typeof obj.autoSwitchModel === "boolean") cfg.autoSwitchModel = obj.autoSwitchModel;
 	if (typeof obj.scopePattern === "string" && obj.scopePattern.trim()) cfg.scopePattern = obj.scopePattern.trim();
 	if (obj.scopeSettings === "project") cfg.scopeSettings = "project";
 	else if (obj.scopeSettings === "global") cfg.scopeSettings = "global";
@@ -300,6 +312,7 @@ function mergeConfigs(base: Config, override: Config): Config {
 		autoScopePattern: useOverrideScalars ? override.autoScopePattern : base.autoScopePattern,
 		scopeSettings: useOverrideScalars ? override.scopeSettings : base.scopeSettings,
 		scopePattern: useOverrideScalars ? override.scopePattern : base.scopePattern,
+		autoSwitchModel: useOverrideScalars ? override.autoSwitchModel : base.autoSwitchModel,
 	};
 }
 
@@ -1034,10 +1047,71 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 		}
 	});
 
+	// Input runs before pi validates auth (and compacts), so it can recover a
+	// provider that polling removed during a restart. Do not change models for
+	// input queued while an agent is already running.
+	let switchStatusTimer: ReturnType<typeof setTimeout> | undefined;
+	pi.on("input", async (_event, ctx) => {
+		try {
+			if (!state.config.autoSwitchModel || !ctx.isIdle()) return;
+			const current = ctx.model;
+			if (!current) return;
+			// The registered map forgets unreachable providers; config still tells
+			// us which server owns the selected model after a restart.
+			const configured = state.config.servers.find((s) => normalizeServer(s).providerName === current.provider);
+			if (!configured) return;
+			const stillSelected = () => {
+				const selected = ctx.model;
+				return ctx.isIdle() && selected?.provider === current.provider && selected.id === current.id;
+			};
+			const server = normalizeServer(withCredential(configured, (await readCredentials()) ?? {}));
+
+			// Check the server live rather than trusting the last poll, which may
+			// be up to pollIntervalMs old.
+			const live = await discoverModels(server, state.config.timeoutMs);
+			if (!live.ok || !stillSelected()) return;
+			const liveIds = modelIdsKey(live.models).split("\n").filter(Boolean);
+			if (!liveIds.length) return;
+			if (liveIds.includes(current.id) && registered.has(current.provider)) return;
+
+			// Restore registration/auth even if the server came back with the same
+			// model. Reconciliation may discover a newer list than the live probe.
+			await runRefresh(state.config, ctx);
+			if (!stillSelected()) return; // preserve a manual selection made during I/O
+			const entry = registered.get(current.provider);
+			if (!entry) return;
+			const ids = entry.modelIdsKey.split("\n").filter(Boolean);
+			if (!ids.length || ids.includes(current.id)) return;
+			const next = ctx.modelRegistry.find(current.provider, ids[0]);
+			if (!next || !(await pi.setModel(next))) return;
+
+			if (!ctx.hasUI || !state.config.status) return;
+			ctx.ui.setStatus(
+				SWITCH_STATUS_KEY,
+				`🦙 switched model: ${current.id} → ${next.id} (${entry.server.displayName})`,
+			);
+			if (switchStatusTimer) clearTimeout(switchStatusTimer);
+			switchStatusTimer = setTimeout(() => {
+				switchStatusTimer = undefined;
+				try {
+					ctx.ui.setStatus(SWITCH_STATUS_KEY, undefined);
+				} catch {
+					/* session may have ended */
+				}
+			}, SWITCH_STATUS_MS);
+		} catch (e) {
+			console.error(`[pi-local-llama] model auto-switch failed: ${errMsg(e)}`);
+		}
+	});
+
 	pi.on("session_shutdown", () => {
 		if (timer) {
 			clearInterval(timer);
 			timer = undefined;
+		}
+		if (switchStatusTimer) {
+			clearTimeout(switchStatusTimer);
+			switchStatusTimer = undefined;
 		}
 		// Intentionally do NOT unregister providers here: "model removed when
 		// server is killed" is handled by reachability polling. We also do NOT

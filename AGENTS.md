@@ -16,7 +16,11 @@ the code.
    live context size**.
 4. Optionally manages a `local-*/*` glob in `settings.json → enabledModels`
    so discovered models join the **Ctrl+P** cycling list.
-5. Detects each server's **real running context** (not a fixed 128k) by
+5. Before each idle prompt (`input`, before auth validation), recovers local
+   providers removed during a restart and switches a model no longer served
+   to that server's first model alphabetically, with a temporary footer status
+   (`autoSwitchModel`). Preserves manual selections made during discovery.
+6. Detects each server's **real running context** (not a fixed 128k) by
    probing llama-server's `/props` and `/slots` — see [Context window
    detection](#context-window-detection) below.
 
@@ -32,6 +36,7 @@ test/
   sanity.mts                 # end-to-end: startup discovery, kill server, rescan
   scope.mts                  # provider-name prefixing + settings.json scope mgmt
   servers.mts                # /local-llama-servers add|list|remove against a mock
+  switch.mts                 # input recovery, model auto-switch + manual-selection races
 local-servers.example.json   # documented example config
 package.json                 # declares the extension via "pi.extensions": ["./src/index.ts"]
 tsconfig.json                # noEmit; used only for editor/type checking
@@ -56,6 +61,7 @@ npx tsc --noEmit
 node test/sanity.mts     # also proves a live poll cycle + provider unregister
 node test/scope.mts      # uses an isolated temp PI_CODING_AGENT_DIR
 node test/servers.mts    # uses an isolated temp PI_CODING_AGENT_DIR + mock server
+node test/switch.mts     # isolated; real Pi prompt preflight + registry, fake extension API/agent loop
 ```
 
 **Note:** `test/sanity.mts` does NOT isolate config, so it will also pick up
@@ -81,11 +87,17 @@ Calls used:
 - `pi.on("session_start", (event, ctx) => ...)` — `event.reason` is
   `"startup" | "reload" | "new" | "resume" | "fork"`. Used to gate the
   first-startup scope-pattern add and to (re)start polling.
+- `pi.on("input", (event, ctx) => ...)` — fires before auth validation and
+  compaction. Used to recover providers removed during a restart and switch
+  stale local models before the current prompt. Skips queued input when
+  `ctx.isIdle()` is false, and rechecks the selected provider/id after I/O.
+- `pi.setModel(model)` — returns false if the model has no auth.
 - `pi.on("session_shutdown", ...)` — clears the poll interval. **Does NOT
   unregister providers** (intentional — see invariants below).
 
 `ctx` (the `ExtensionContext` / `ExtensionCommandContext`) fields used:
 - `ctx.cwd`, `ctx.hasUI`, `ctx.isProjectTrusted()`, `ctx.mode`.
+- `ctx.model` (current model; may be undefined), `ctx.modelRegistry.find(provider, id)`, `ctx.isIdle()`.
 - `ctx.ui.notify(message, "info" | "warning" | "error")`.
 - `ctx.ui.setStatus(key, text | undefined)` — footer status line.
 
@@ -123,7 +135,8 @@ Three things to internalize:
    mid-session will NOT re-register — by design.
 3. **`refresh()` is the single source of truth** for register/unregister and
    for emitting notifications + footer status. Startup discovery, polling,
-   `/local-llama-rescan`, and post-add/remove all funnel through it.
+   before-prompt recovery, `/local-llama-rescan`, and post-add/remove all funnel
+   through it.
 
 ## Key invariants (do not break these)
 
@@ -165,7 +178,7 @@ They configure different things and are intentionally separate commands.
   later sources override earlier ones for the same URL (deep object merge per
   server is NOT done — later entry replaces entirely, so include all fields).
 - **Scalars** (pollIntervalMs, timeoutMs, notify, status, scopeSettings,
-  scopePattern, autoScopePattern) are taken from the **override** ONLY if the
+  scopePattern, autoScopePattern, autoSwitchModel) are taken from the **override** ONLY if the
   override contributed ≥1 server; otherwise the base's scalars win.
   (`useOverrideScalars = override.servers.length > 0`.)
 - `discoverAtStartup` is the boolean AND of both (either side can disable it).
@@ -255,6 +268,7 @@ certainly the cause, not a bug in this extension.
 | settings.json corrupted / race | `writeSettingsObject()` (tmp+rename); pi writing concurrently |
 | Wrong servers loaded | config merge order (global → env → project); a stale `local-llama-servers.json` |
 | Status footer wrong | `emitStatus()` / `emitNotifications()` / `emitStartupSummary()` |
+| Model not auto-switched after server relaunch | `input` handler: `autoSwitchModel`, `ctx.isIdle()`, matching server in `state.config`, live discovery, and unchanged selection after I/O |
 | Command not found / wrong parsing | the `local-llama-servers` arg tokenizing (`--project` strip) in the handler |
 
 ## Conventions for changes
