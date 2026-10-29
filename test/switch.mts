@@ -3,7 +3,7 @@
 // and agent loop, to verify restart recovery and manual-selection races.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -33,9 +33,11 @@ const PORT = server.address().port;
 const PROVIDER = `local-127-0-0-1-${PORT}`;
 // Fallback servers, down unless a test brings them up.
 async function mockServer() {
-	const mock = { served: [], down: true };
+	// downAfter: answer that many more /models requests, then go down.
+	const mock = { served: [], down: true, requests: 0, downAfter: Infinity };
 	const srv = createServer((req, res) => {
 		res.setHeader("content-type", "application/json");
+		if (!mock.down && req.url === "/v1/models" && mock.downAfter-- <= 0) mock.down = true;
 		if (mock.down || req.url !== "/v1/models") { res.writeHead(mock.down ? 503 : 404); res.end(); return; }
 		res.end(JSON.stringify({ data: mock.served.map((id) => ({ id })) }));
 	});
@@ -250,10 +252,40 @@ try {
 		// Untrusted project settings are left alone.
 		assert.deepEqual(readJson(projectSettings), { defaultProvider: PROVIDER, defaultModel: "qwen:27b" });
 	});
+	await check("fallback that vanishes before the switch leaves the selection registered", async () => {
+		served = ["qwen:27b"];
+		await rescan();
+		currentModel = registry.find(PROVIDER, "qwen:27b");
+		const calls = setModelCalls;
+		B.served = ["b-first"]; B.down = false; B.downAfter = 1; // live probe answers, rescan fails
+		down = true;
+		try { await prompt(); } finally { down = false; B.downAfter = Infinity; }
+		assert.equal(setModelCalls, calls);
+		assert.equal(promptedModel.provider, PROVIDER);
+		assert.ok(registry.find(PROVIDER, "qwen:27b"));
+	});
 	B.down = true;
 	C.down = true;
 	served = ["qwen:27b"];
 	await rescan();
+
+	await check("served '<id>:<level>' entries, partial project defaults and stale locks", async () => {
+		currentModel = registry.find(PROVIDER, "qwen:27b");
+		served = ["qwen:27b:high", "a-new"];
+		writeJson(globalSettings, { enabledModels: [`${PROVIDER}/qwen:27b:high`, `${PROVIDER}/qwen:27b`] });
+		writeJson(projectSettings, { defaultModel: "qwen:27b" });
+		const lock = `${globalSettings}.lock`;
+		mkdirSync(lock);
+		utimesSync(lock, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
+		trusted = true;
+		try { await prompt(); } finally { trusted = false; }
+		assert.equal(promptedModel.id, "a-new");
+		// `qwen:27b:high` is a served model of its own, not qwen:27b at high thinking.
+		assert.deepEqual(readJson(globalSettings).enabledModels, [`${PROVIDER}/qwen:27b:high`, `${PROVIDER}/a-new`]);
+		// A project default with only defaultModel still overrides global, so it is rewritten.
+		assert.deepEqual(readJson(projectSettings), { defaultModel: "a-new" });
+		assert.equal(existsSync(lock), false);
+	});
 
 	await check("queued input does not probe or switch a streaming agent", async () => {
 		currentModel = { ...currentModel, provider: PROVIDER, id: "old" };

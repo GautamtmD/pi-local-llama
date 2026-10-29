@@ -62,7 +62,8 @@
  * `pi remove`, since the extension can no longer run after it is uninstalled.
  */
 
-import { mkdir, readFile, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdirSync, readFileSync, renameSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
@@ -589,39 +590,71 @@ interface ModelRef {
 	id: string;
 }
 
-/** Take pi's proper-lockfile-compatible `<path>.lock` directory around `fn`. */
-async function withSettingsLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+/**
+ * Take pi's proper-lockfile-compatible `<path>.lock` directory around `fn`.
+ * The locked section is synchronous on purpose: pi retries its own lock in a
+ * blocking loop, so awaiting while holding it would starve pi's write in this
+ * process, and a section this short cannot outlive the stale threshold.
+ */
+async function withSettingsLock<T>(path: string, fn: () => T): Promise<T> {
 	const lock = `${path}.lock`;
 	for (let attempt = 1; ; attempt++) {
 		try {
-			await mkdir(lock);
-			break;
+			mkdirSync(lock);
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
-			const age = await stat(lock).then((s) => Date.now() - s.mtimeMs, () => 0);
-			if (age > SETTINGS_LOCK_STALE_MS) {
-				await rmdir(lock).catch(() => {});
-				continue;
+			let removed = false;
+			try {
+				if (Date.now() - statSync(lock).mtimeMs > SETTINGS_LOCK_STALE_MS) {
+					rmdirSync(lock);
+					removed = true;
+				}
+			} catch {
+				/* lock released meanwhile, or a stale lock we cannot remove */
 			}
 			if (attempt >= SETTINGS_LOCK_ATTEMPTS) throw new Error(`settings lock is busy: ${lock}`);
-			await new Promise((resolve) => setTimeout(resolve, SETTINGS_LOCK_DELAY_MS));
+			if (!removed) await new Promise((resolve) => setTimeout(resolve, SETTINGS_LOCK_DELAY_MS));
+			continue;
 		}
-	}
-	try {
-		return await fn();
-	} finally {
-		await rmdir(lock).catch(() => {});
+		try {
+			return fn();
+		} finally {
+			try {
+				rmdirSync(lock);
+			} catch {
+				/* already gone */
+			}
+		}
 	}
 }
 
-/** The `:<level>` suffix of an exact `enabledModels` entry for `ref`, or undefined. */
-function scopeEntrySuffix(entry: string, ref: ModelRef): string | undefined {
+/** Synchronous readSettingsObject() for use while holding the settings lock. */
+function readSettingsObjectSync(path: string): Record<string, unknown> | null {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(readFileSync(path, "utf8"));
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return {};
+		console.error(`[pi-local-llama] failed to read ${path}: ${errMsg(e)}`);
+		return null;
+	}
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	return raw as Record<string, unknown>;
+}
+
+/**
+ * The `:<level>` suffix of an exact `enabledModels` entry for `ref`, or
+ * undefined. `<id>:<level>` that is itself a served model id names that
+ * model, as pi's exact-match-first resolution would.
+ */
+function scopeEntrySuffix(entry: string, ref: ModelRef, isModel: (ref: ModelRef) => boolean): string | undefined {
 	const exact = `${ref.provider}/${ref.id}`.toLowerCase();
 	const lower = entry.toLowerCase();
 	if (lower === exact) return "";
 	if (!lower.startsWith(`${exact}:`)) return undefined;
 	const level = entry.slice(exact.length + 1);
-	return THINKING_SUFFIXES.includes(level) ? `:${level}` : undefined;
+	if (!THINKING_SUFFIXES.includes(level)) return undefined;
+	return isModel({ provider: ref.provider, id: entry.slice(ref.provider.length + 1) }) ? undefined : `:${level}`;
 }
 
 /**
@@ -631,35 +664,52 @@ function scopeEntrySuffix(entry: string, ref: ModelRef): string | undefined {
  *     `:<level>` suffix). A same-server switch replaces the stale entry; a
  *     cross-server switch keeps it, since that server may come back. Globs
  *     are left alone — they already match whatever is registered.
- *   - a `defaultProvider`/`defaultModel` pointing at `from` is rewritten.
- *     Pi's setModel only updates the global file; a project file overrides it.
+ *   - `defaultProvider`/`defaultModel` fields pointing at `from` are
+ *     rewritten. Pi merges the two independently and its setModel only updates
+ *     the global file, so a project file setting either one overrides it.
  */
-async function syncSwitchedModel(path: string, from: ModelRef, to: ModelRef, replace: boolean): Promise<boolean> {
+async function syncSwitchedModel(
+	path: string,
+	from: ModelRef,
+	to: ModelRef,
+	replace: boolean,
+	isModel: (ref: ModelRef) => boolean,
+): Promise<boolean> {
 	const update = (settings: Record<string, unknown>): boolean => {
 		let changed = false;
 		const cur = settings.enabledModels;
 		if (Array.isArray(cur)) {
+			const suffixes = cur.map((e) => typeof e === "string" ? scopeEntrySuffix(e, from, isModel) : undefined);
+			// Dedupe against entries that survive, not ones being replaced.
+			const kept = cur.filter((_, i) => suffixes[i] === undefined || !replace);
 			const next: unknown[] = [];
-			const newRef = `${to.provider}/${to.id}`;
-			const hasNew = (s: string) => next.some((p) => typeof p === "string" && p.toLowerCase() === s.toLowerCase()) ||
-				cur.some((p) => typeof p === "string" && p.toLowerCase() === s.toLowerCase());
-			for (const entry of cur) {
-				const suffix = typeof entry === "string" ? scopeEntrySuffix(entry, from) : undefined;
+			const has = (s: string) => [...kept, ...next].some((p) => typeof p === "string" && p.toLowerCase() === s.toLowerCase());
+			cur.forEach((entry, i) => {
+				const suffix = suffixes[i];
 				if (suffix === undefined) {
 					next.push(entry);
-					continue;
+					return;
 				}
-				const add = !hasNew(newRef + suffix);
-				if (add) next.push(newRef + suffix);
+				const add = !has(`${to.provider}/${to.id}${suffix}`);
+				if (add) next.push(`${to.provider}/${to.id}${suffix}`);
 				if (!replace) next.push(entry);
 				if (add || replace) changed = true;
-			}
+			});
 			if (changed) settings.enabledModels = next;
 		}
-		if (settings.defaultProvider === from.provider && settings.defaultModel === from.id) {
-			settings.defaultProvider = to.provider;
-			settings.defaultModel = to.id;
-			changed = true;
+		const hasProvider = typeof settings.defaultProvider === "string";
+		const hasModel = typeof settings.defaultModel === "string";
+		if ((hasProvider || hasModel) &&
+			(!hasProvider || settings.defaultProvider === from.provider) &&
+			(!hasModel || settings.defaultModel === from.id)) {
+			if (hasProvider && from.provider !== to.provider) {
+				settings.defaultProvider = to.provider;
+				changed = true;
+			}
+			if (hasModel && from.id !== to.id) {
+				settings.defaultModel = to.id;
+				changed = true;
+			}
 		}
 		return changed;
 	};
@@ -667,10 +717,12 @@ async function syncSwitchedModel(path: string, from: ModelRef, to: ModelRef, rep
 	// Cheap unlocked check first: most settings files need no change.
 	const preview = await readSettingsObject(path);
 	if (!preview || !update(preview)) return false;
-	return withSettingsLock(path, async () => {
-		const settings = await readSettingsObject(path);
+	return withSettingsLock(path, () => {
+		const settings = readSettingsObjectSync(path);
 		if (!settings || !update(settings)) return false;
-		await writeSettingsObject(path, settings);
+		const tmp = `${path}.tmp`;
+		writeFileSync(tmp, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+		renameSync(tmp, path);
 		return true;
 	});
 }
@@ -918,6 +970,7 @@ async function refresh(
 	registered: Map<string, RegisteredEntry>,
 	authStates: Map<string, "missing" | "rejected">,
 	ctx?: CtxLike,
+	keep?: string, // provider left registered even if down (the next poll removes it)
 ): Promise<RefreshSummary> {
 	const summary: RefreshSummary = {
 		added: [],
@@ -969,7 +1022,7 @@ async function refresh(
 			summary.up.push({ server, count: result.models.length });
 		} else {
 			const prev = registered.get(server.providerName);
-			if (prev) {
+			if (prev && server.providerName !== keep) {
 				pi.unregisterProvider(server.providerName);
 				registered.delete(server.providerName);
 				summary.removed.push({ server, reason: result.auth === "missing" ? "API key required" : result.auth === "rejected" ? "API key rejected" : result.error });
@@ -1098,8 +1151,8 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 	const authStates = new Map<string, "missing" | "rejected">();
 	// A command can rescan while a poll is in flight; apply results in order.
 	let pendingRefresh: Promise<void> = Promise.resolve();
-	function runRefresh(config: Config, ctx?: CtxLike): Promise<RefreshSummary> {
-		const run = pendingRefresh.then(() => refresh(pi, config, registered, authStates, ctx));
+	function runRefresh(config: Config, ctx?: CtxLike, keep?: string): Promise<RefreshSummary> {
+		const run = pendingRefresh.then(() => refresh(pi, config, registered, authStates, ctx, keep));
 		pendingRefresh = run.then(() => {}, () => {});
 		return run;
 	}
@@ -1198,13 +1251,16 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 
 			// Restore registration/auth even if the server came back with the same
 			// model. Reconciliation may discover a newer list than the live probe,
-			// and registers any other server that came up since the last poll.
-			await runRefresh(state.config, ctx);
+			// and registers any other server that came up since the last poll. When
+			// falling back, keep the selected provider registered in case the
+			// fallback vanishes before the switch; the next poll removes it.
+			await runRefresh(state.config, ctx, live.ok ? undefined : current.provider);
 			if (!stillSelected()) return; // preserve a manual selection made during I/O
 			const idsOf = (e: RegisteredEntry) => e.modelIdsKey.split("\n").filter(Boolean);
-			const own = registered.get(current.provider);
 			let target: { entry: RegisteredEntry; id: string } | undefined;
-			if (own) {
+			if (live.ok) {
+				const own = registered.get(current.provider);
+				if (!own) return;
 				const ids = idsOf(own);
 				if (!ids.length || ids.includes(current.id)) return;
 				target = { entry: own, id: ids[0] };
@@ -1230,7 +1286,7 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 			if (ctx.isProjectTrusted()) paths.push(settingsFilePath("project", ctx.cwd));
 			for (const path of paths) {
 				try {
-					await syncSwitchedModel(path, current, next, sameServer);
+					await syncSwitchedModel(path, current, next, sameServer, (m) => !!ctx.modelRegistry.find(m.provider, m.id));
 				} catch (e) {
 					console.error(`[pi-local-llama] failed to update ${path}: ${errMsg(e)}`);
 				}

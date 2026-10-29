@@ -31,9 +31,11 @@ A [Pi](https://pi.dev) extension that **auto-detects OpenAI-compatible local LLM
   old model (as saved by `/scoped-models`) get a matching entry for the new
   one, keeping any `:<thinking>` suffix — replacing the old entry for a
   same-server switch, keeping it for a cross-server fallback (that server may
-  come back). Globs like `local-*/*` are left alone. A project-level
-  `defaultModel` pointing at the old model is rewritten too; Pi itself saves
-  the global default. Global settings always, project settings only in
+  come back). Globs like `local-*/*` are left alone, and an entry like
+  `old:high` that is itself a served model id is treated as that model.
+  Project-level `defaultProvider`/`defaultModel` fields pointing at the old
+  model are rewritten too (either may be set alone); Pi itself saves the
+  global default. Global settings always, project settings only in
   trusted projects. The current session's Ctrl+P list is a startup snapshot
   and is not changed.
 
