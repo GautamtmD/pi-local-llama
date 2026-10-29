@@ -3,7 +3,7 @@
 // and agent loop, to verify restart recovery and manual-selection races.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -31,7 +31,26 @@ const server = createServer((req, res) => {
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const PORT = server.address().port;
 const PROVIDER = `local-127-0-0-1-${PORT}`;
-const config = { pollIntervalMs: 60000, timeoutMs: 2000, autoScopePattern: false, servers: [`http://127.0.0.1:${PORT}/v1`] };
+// Fallback servers, down unless a test brings them up.
+async function mockServer() {
+	const mock = { served: [], down: true };
+	const srv = createServer((req, res) => {
+		res.setHeader("content-type", "application/json");
+		if (mock.down || req.url !== "/v1/models") { res.writeHead(mock.down ? 503 : 404); res.end(); return; }
+		res.end(JSON.stringify({ data: mock.served.map((id) => ({ id })) }));
+	});
+	await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+	const port = srv.address().port;
+	return Object.assign(mock, { srv, url: `http://127.0.0.1:${port}/v1`, provider: `local-127-0-0-1-${port}` });
+}
+const B = await mockServer();
+const C = await mockServer();
+const config = { pollIntervalMs: 60000, timeoutMs: 2000, autoScopePattern: false, servers: [`http://127.0.0.1:${PORT}/v1`, B.url, C.url] };
+const globalSettings = join(TMP, "settings.json");
+const projectSettings = join(TMP, ".pi", "settings.json");
+mkdirSync(join(TMP, ".pi"));
+const writeJson = (path, obj) => writeFileSync(path, JSON.stringify(obj));
+const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 const writeConfig = (extra = {}) => writeFileSync(join(TMP, "local-llama-servers.json"), JSON.stringify({ ...config, ...extra }));
 writeConfig();
 
@@ -45,8 +64,9 @@ let currentModel;
 let idle = true;
 let setModelCalls = 0;
 let promptedModel;
+let trusted = false;
 const ctx = {
-	cwd: TMP, mode: "tui", hasUI: true, isProjectTrusted: () => false, isIdle: () => idle,
+	cwd: TMP, mode: "tui", hasUI: true, isProjectTrusted: () => trusted, isIdle: () => idle,
 	ui: { notify() {}, setStatus: (k, v) => { if (v === undefined) statuses.delete(k); else statuses.set(k, v); } },
 	get model() { return currentModel; },
 	modelRegistry: registry,
@@ -109,8 +129,12 @@ try {
 	});
 	await check("missing model switches alphabetically before the prompt", async () => {
 		served = ["mistral:7b", "gemma:9b", "zephyr:3b"];
+		writeJson(globalSettings, { enabledModels: ["manual/chosen", `${PROVIDER}/qwen:27b`, `${PROVIDER}/qwen:27b:high`, "local-*/*"] });
 		await prompt();
 		assert.equal(promptedModel.id, "gemma:9b");
+		// Same-server switch replaces exact scope entries, keeping suffixes and globs.
+		assert.deepEqual(readJson(globalSettings).enabledModels,
+			["manual/chosen", `${PROVIDER}/gemma:9b`, `${PROVIDER}/gemma:9b:high`, "local-*/*"]);
 		assert.equal(setModelCalls, 1);
 		assert.ok(registry.find(PROVIDER, "gemma:9b"));
 		const status = statuses.get("local-llama-switch") ?? "";
@@ -125,13 +149,14 @@ try {
 		assert.equal(currentModel, otherModel);
 		assert.equal(modelRequests, requests);
 	});
-	await check("empty or unreachable server does not switch", async () => {
+	await check("empty or unreachable server with no fallback does not switch", async () => {
 		currentModel = registry.find(PROVIDER, "gemma:9b");
 		const calls = setModelCalls;
 		served = [];
 		await prompt();
 		down = true;
-		try { await prompt(); } finally { down = false; }
+		// The rescan for a fallback unregisters the down provider, as the next poll would.
+		try { await assert.rejects(prompt(), /No API key/); } finally { down = false; }
 		assert.equal(currentModel.id, "gemma:9b");
 		assert.equal(setModelCalls, calls);
 	});
@@ -186,6 +211,43 @@ try {
 		}
 	}
 
+	await check("down server falls back to another server serving the same model", async () => {
+		served = ["qwen:27b"];
+		await rescan();
+		currentModel = registry.find(PROVIDER, "qwen:27b");
+		B.served = ["zz", "b-first"]; B.down = false;
+		C.served = ["qwen:27b"]; C.down = false;
+		writeJson(globalSettings, { enabledModels: [`${PROVIDER}/qwen:27b:high`, "manual/chosen"] });
+		writeJson(projectSettings, { defaultProvider: PROVIDER, defaultModel: "qwen:27b" });
+		down = true;
+		trusted = true;
+		try { await prompt(); } finally { down = false; trusted = false; }
+		assert.equal(promptedModel.provider, C.provider);
+		assert.equal(promptedModel.id, "qwen:27b");
+		// Cross-server switch adds the new entry ahead of the old one (it may come back).
+		assert.deepEqual(readJson(globalSettings).enabledModels,
+			[`${C.provider}/qwen:27b:high`, `${PROVIDER}/qwen:27b:high`, "manual/chosen"]);
+		assert.deepEqual(readJson(projectSettings), { defaultProvider: C.provider, defaultModel: "qwen:27b" });
+		assert.ok((statuses.get("local-llama-switch") ?? "").includes(C.provider));
+	});
+	await check("down server falls back to the first reachable server's first model", async () => {
+		served = ["qwen:27b"];
+		await rescan();
+		currentModel = registry.find(PROVIDER, "qwen:27b");
+		C.down = true;
+		writeJson(projectSettings, { defaultProvider: PROVIDER, defaultModel: "qwen:27b" });
+		down = true;
+		try { await prompt(); } finally { down = false; }
+		assert.equal(promptedModel.provider, B.provider);
+		assert.equal(promptedModel.id, "b-first");
+		// Untrusted project settings are left alone.
+		assert.deepEqual(readJson(projectSettings), { defaultProvider: PROVIDER, defaultModel: "qwen:27b" });
+	});
+	B.down = true;
+	C.down = true;
+	served = ["qwen:27b"];
+	await rescan();
+
 	await check("queued input does not probe or switch a streaming agent", async () => {
 		currentModel = { ...currentModel, provider: PROVIDER, id: "old" };
 		const requests = modelRequests;
@@ -222,7 +284,9 @@ try {
 	});
 } finally {
 	await events.get("session_shutdown")?.({ reason: "quit" }, ctx);
-	await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	for (const srv of [server, B.srv, C.srv]) {
+		await new Promise((resolve, reject) => srv.close((error) => error ? reject(error) : resolve()));
+	}
 	rmSync(TMP, { recursive: true, force: true });
 }
 console.log(failed ? `\n${failed} FAILED` : "\nALL PASSED");

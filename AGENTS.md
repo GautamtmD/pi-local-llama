@@ -19,7 +19,12 @@ the code.
 5. Before each idle prompt (`input`, before auth validation), recovers local
    providers removed during a restart and switches a model no longer served
    to that server's first model alphabetically, with a temporary footer status
-   (`autoSwitchModel`). Preserves manual selections made during discovery.
+   (`autoSwitchModel`). If that server is down, falls back to another
+   configured server (same model id preferred, else first reachable server's
+   first model). Preserves manual selections made during discovery. After a
+   switch, `syncSwitchedModel()` rewrites exact `enabledModels` entries and a
+   project `defaultModel` for the old model (under pi's `settings.json.lock`)
+   so new pi processes / sub-agents start on the new model.
 6. Detects each server's **real running context** (not a fixed 128k) by
    probing llama-server's `/props` and `/slots` — see [Context window
    detection](#context-window-detection) below.
@@ -268,7 +273,8 @@ certainly the cause, not a bug in this extension.
 | settings.json corrupted / race | `writeSettingsObject()` (tmp+rename); pi writing concurrently |
 | Wrong servers loaded | config merge order (global → env → project); a stale `local-llama-servers.json` |
 | Status footer wrong | `emitStatus()` / `emitNotifications()` / `emitStartupSummary()` |
-| Model not auto-switched after server relaunch | `input` handler: `autoSwitchModel`, `ctx.isIdle()`, matching server in `state.config`, live discovery, and unchanged selection after I/O |
+| Model not auto-switched after server relaunch | `input` handler: `autoSwitchModel`, `ctx.isIdle()`, matching server in `state.config`, live discovery, and unchanged selection after I/O; for cross-server fallback, the other servers' `registered` entries after `runRefresh` |
+| Sub-agent starts on the wrong model after a switch | `syncSwitchedModel()` (exact entries only, not globs); project `defaultModel` overriding global; pi's startup picks the saved default only if it is in scope |
 | Command not found / wrong parsing | the `local-llama-servers` arg tokenizing (`--project` strip) in the handler |
 
 ## Conventions for changes

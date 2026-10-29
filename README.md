@@ -19,10 +19,23 @@ A [Pi](https://pi.dev) extension that **auto-detects OpenAI-compatible local LLM
 - Before each idle prompt, if the selected model is from a local server that no
   longer serves it (e.g. llama-server relaunched with a different model),
   **switches to that server's first model alphabetically** and briefly shows
-  `🦙 switched model: old → new` in the footer. Disable with
-  `"autoSwitchModel": false`. Recovers providers removed during a restart
-  before Pi checks authentication, and preserves manual model selections made
-  while the server check is running.
+  `🦙 switched model: old → new` in the footer. If that server is **down**,
+  falls back to another configured local server — one serving the **same
+  model id** if any, otherwise the first reachable server (config order) and
+  its first model alphabetically. Disable with `"autoSwitchModel": false`.
+  Recovers providers removed during a restart before Pi checks
+  authentication, and preserves manual model selections made while the server
+  check is running.
+- After an auto-switch, updates `settings.json` so **new pi processes (e.g.
+  sub-agents) start on the new model**: exact `enabledModels` entries for the
+  old model (as saved by `/scoped-models`) get a matching entry for the new
+  one, keeping any `:<thinking>` suffix — replacing the old entry for a
+  same-server switch, keeping it for a cross-server fallback (that server may
+  come back). Globs like `local-*/*` are left alone. A project-level
+  `defaultModel` pointing at the old model is rewritten too; Pi itself saves
+  the global default. Global settings always, project settings only in
+  trusted projects. The current session's Ctrl+P list is a startup snapshot
+  and is not changed.
 
 ## About "scoped models" and the Ctrl+P pattern
 
@@ -244,10 +257,14 @@ meaningful there.)
   local model's server in config and checks `/models` live, even if polling
   removed the provider during a restart. Re-syncs a recovered provider to
   restore authentication. If the model id is gone but the server serves
-  others, switches to the first model id alphabetically, with a temporary
-  (10s) footer status. A manual selection made during the check is preserved.
-  Non-local models, unreachable servers, and input queued while the agent is
-  running are left alone.
+  others, switches to the first model id alphabetically. If the server is
+  unreachable (or rejects auth), rescans all servers and falls back to another
+  configured one: the first serving the same model id, else the first with any
+  models (its first id alphabetically). Shows a temporary (10s) footer status
+  and syncs `enabledModels` / project `defaultModel` (see above). A manual
+  selection made during the check is preserved. Non-local models, servers
+  answering with no models, the case where no other server is reachable, and
+  input queued while the agent is running are left alone.
 - **Shutdown (`session_shutdown`):** clears the interval. Providers are *left
   registered* — "model removed when server is killed" is handled by
   reachability polling, not by session end, so switching sessions won't yank

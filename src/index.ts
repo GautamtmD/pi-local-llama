@@ -27,9 +27,15 @@
  *   - Before each idle prompt (`input`, before authentication), recovers
  *     configured local providers removed during a server restart. If the
  *     selected model is no longer served, switches to the server's first
- *     model alphabetically and shows a temporary footer status
- *     (`autoSwitchModel`, default on). Preserves manual model selections made
- *     while checking the server.
+ *     model alphabetically. If its server is unavailable, falls back to another
+ *     configured server: one serving the same model id, else the first
+ *     reachable one (config order) and its first model alphabetically. Shows a
+ *     temporary footer status (`autoSwitchModel`, default on). Preserves manual
+ *     model selections made while checking servers.
+ *   - After an auto-switch, rewrites exact `enabledModels` entries for the old
+ *     model (global + trusted project settings.json) and a project-level
+ *     default pointing at it, so new pi processes (e.g. sub-agents) start on
+ *     the new model. Pi itself saves the global default.
  *
  * Every provider registered by this extension is named with the `local-`
  * prefix (e.g. `local-localhost-1234`), so the configured scope glob reliably
@@ -56,7 +62,7 @@
  * `pi remove`, since the extension can no longer run after it is uninstalled.
  */
 
-import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
@@ -86,6 +92,15 @@ const DEFAULT_CONTEXT_WINDOW = 128000;
 /** Footer status key and lifetime for the temporary "model switched" message. */
 const SWITCH_STATUS_KEY = "local-llama-switch";
 const SWITCH_STATUS_MS = 10000;
+/** `:<level>` suffixes pi accepts on `enabledModels` entries. */
+const THINKING_SUFFIXES = ["off", "minimal", "low", "medium", "high", "xhigh"];
+/**
+ * Pi guards settings.json with proper-lockfile: a `<file>.lock` directory,
+ * considered stale after 10s. Pi gives up after ~200ms, so hold it briefly.
+ */
+const SETTINGS_LOCK_STALE_MS = 10000;
+const SETTINGS_LOCK_ATTEMPTS = 50;
+const SETTINGS_LOCK_DELAY_MS = 20;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -563,6 +578,101 @@ async function scopePatternStatus(path: string, pattern: string): Promise<{ pres
 	const cur = settings?.enabledModels;
 	const arr = Array.isArray(cur) ? cur.filter((p): p is string => typeof p === "string") : [];
 	return { present: arr.includes(pattern), enabledModels: arr };
+}
+
+// ---------------------------------------------------------------------------
+// settings.json sync after an auto-switch (scoped models + project default)
+// ---------------------------------------------------------------------------
+
+interface ModelRef {
+	provider: string;
+	id: string;
+}
+
+/** Take pi's proper-lockfile-compatible `<path>.lock` directory around `fn`. */
+async function withSettingsLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+	const lock = `${path}.lock`;
+	for (let attempt = 1; ; attempt++) {
+		try {
+			await mkdir(lock);
+			break;
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
+			const age = await stat(lock).then((s) => Date.now() - s.mtimeMs, () => 0);
+			if (age > SETTINGS_LOCK_STALE_MS) {
+				await rmdir(lock).catch(() => {});
+				continue;
+			}
+			if (attempt >= SETTINGS_LOCK_ATTEMPTS) throw new Error(`settings lock is busy: ${lock}`);
+			await new Promise((resolve) => setTimeout(resolve, SETTINGS_LOCK_DELAY_MS));
+		}
+	}
+	try {
+		return await fn();
+	} finally {
+		await rmdir(lock).catch(() => {});
+	}
+}
+
+/** The `:<level>` suffix of an exact `enabledModels` entry for `ref`, or undefined. */
+function scopeEntrySuffix(entry: string, ref: ModelRef): string | undefined {
+	const exact = `${ref.provider}/${ref.id}`.toLowerCase();
+	const lower = entry.toLowerCase();
+	if (lower === exact) return "";
+	if (!lower.startsWith(`${exact}:`)) return undefined;
+	const level = entry.slice(exact.length + 1);
+	return THINKING_SUFFIXES.includes(level) ? `:${level}` : undefined;
+}
+
+/**
+ * Point settings at the model the extension switched to, so a fresh `pi`
+ * (e.g. a sub-agent) starts on it:
+ *   - exact `enabledModels` entries for `from` gain an entry for `to` (same
+ *     `:<level>` suffix). A same-server switch replaces the stale entry; a
+ *     cross-server switch keeps it, since that server may come back. Globs
+ *     are left alone — they already match whatever is registered.
+ *   - a `defaultProvider`/`defaultModel` pointing at `from` is rewritten.
+ *     Pi's setModel only updates the global file; a project file overrides it.
+ */
+async function syncSwitchedModel(path: string, from: ModelRef, to: ModelRef, replace: boolean): Promise<boolean> {
+	const update = (settings: Record<string, unknown>): boolean => {
+		let changed = false;
+		const cur = settings.enabledModels;
+		if (Array.isArray(cur)) {
+			const next: unknown[] = [];
+			const newRef = `${to.provider}/${to.id}`;
+			const hasNew = (s: string) => next.some((p) => typeof p === "string" && p.toLowerCase() === s.toLowerCase()) ||
+				cur.some((p) => typeof p === "string" && p.toLowerCase() === s.toLowerCase());
+			for (const entry of cur) {
+				const suffix = typeof entry === "string" ? scopeEntrySuffix(entry, from) : undefined;
+				if (suffix === undefined) {
+					next.push(entry);
+					continue;
+				}
+				const add = !hasNew(newRef + suffix);
+				if (add) next.push(newRef + suffix);
+				if (!replace) next.push(entry);
+				if (add || replace) changed = true;
+			}
+			if (changed) settings.enabledModels = next;
+		}
+		if (settings.defaultProvider === from.provider && settings.defaultModel === from.id) {
+			settings.defaultProvider = to.provider;
+			settings.defaultModel = to.id;
+			changed = true;
+		}
+		return changed;
+	};
+
+	// Cheap unlocked check first: most settings files need no change.
+	const preview = await readSettingsObject(path);
+	if (!preview || !update(preview)) return false;
+	return withSettingsLock(path, async () => {
+		const settings = await readSettingsObject(path);
+		if (!settings || !update(settings)) return false;
+		await writeSettingsObject(path, settings);
+		return true;
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,26 +1179,59 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 			// Check the server live rather than trusting the last poll, which may
 			// be up to pollIntervalMs old.
 			const live = await discoverModels(server, state.config.timeoutMs);
-			if (!live.ok || !stillSelected()) return;
-			const liveIds = modelIdsKey(live.models).split("\n").filter(Boolean);
-			if (!liveIds.length) return;
-			if (liveIds.includes(current.id) && registered.has(current.provider)) return;
+			if (!stillSelected()) return;
+			if (live.ok) {
+				const liveIds = modelIdsKey(live.models).split("\n").filter(Boolean);
+				if (!liveIds.length) return;
+				if (liveIds.includes(current.id) && registered.has(current.provider)) return;
+			}
 
 			// Restore registration/auth even if the server came back with the same
-			// model. Reconciliation may discover a newer list than the live probe.
+			// model. Reconciliation may discover a newer list than the live probe,
+			// and registers any other server that came up since the last poll.
 			await runRefresh(state.config, ctx);
 			if (!stillSelected()) return; // preserve a manual selection made during I/O
-			const entry = registered.get(current.provider);
-			if (!entry) return;
-			const ids = entry.modelIdsKey.split("\n").filter(Boolean);
-			if (!ids.length || ids.includes(current.id)) return;
-			const next = ctx.modelRegistry.find(current.provider, ids[0]);
+			const idsOf = (e: RegisteredEntry) => e.modelIdsKey.split("\n").filter(Boolean);
+			const own = registered.get(current.provider);
+			let target: { entry: RegisteredEntry; id: string } | undefined;
+			if (own) {
+				const ids = idsOf(own);
+				if (!ids.length || ids.includes(current.id)) return;
+				target = { entry: own, id: ids[0] };
+			} else {
+				// The selected server is unavailable: fall back to another configured
+				// server, preferring one that serves the same model id, else the first
+				// reachable server (config order) with its first model alphabetically.
+				const others = state.config.servers
+					.map((s) => registered.get(normalizeServer(s).providerName))
+					.filter((e): e is RegisteredEntry => !!e && e.server.providerName !== current.provider && idsOf(e).length > 0);
+				const same = others.find((e) => idsOf(e).includes(current.id));
+				if (same) target = { entry: same, id: current.id };
+				else if (others.length) target = { entry: others[0], id: idsOf(others[0])[0] };
+			}
+			if (!target) return;
+			const next = ctx.modelRegistry.find(target.entry.server.providerName, target.id);
 			if (!next || !(await pi.setModel(next))) return;
+
+			// Persist the switch for future pi processes (e.g. sub-agents): pi's
+			// setModel saved the global default; fix scoped models and project default.
+			const sameServer = next.provider === current.provider;
+			const paths = [settingsFilePath("global", ctx.cwd)];
+			if (ctx.isProjectTrusted()) paths.push(settingsFilePath("project", ctx.cwd));
+			for (const path of paths) {
+				try {
+					await syncSwitchedModel(path, current, next, sameServer);
+				} catch (e) {
+					console.error(`[pi-local-llama] failed to update ${path}: ${errMsg(e)}`);
+				}
+			}
 
 			if (!ctx.hasUI || !state.config.status) return;
 			ctx.ui.setStatus(
 				SWITCH_STATUS_KEY,
-				`🦙 switched model: ${current.id} → ${next.id} (${entry.server.displayName})`,
+				sameServer
+					? `🦙 switched model: ${current.id} → ${next.id} (${target.entry.server.displayName})`
+					: `🦙 switched model: ${current.provider}/${current.id} → ${next.provider}/${next.id} (${target.entry.server.displayName})`,
 			);
 			if (switchStatusTimer) clearTimeout(switchStatusTimer);
 			switchStatusTimer = setTimeout(() => {
