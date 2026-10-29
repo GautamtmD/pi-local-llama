@@ -258,9 +258,11 @@ meaningful there.)
   removed the provider during a restart. Re-syncs a recovered provider to
   restore authentication. If the model id is gone but the server serves
   others, switches to the first model id alphabetically. If the server is
-  unreachable (or rejects auth), rescans all servers and falls back to another
-  configured one: the first serving the same model id, else the first with any
-  models (its first id alphabetically). Shows a temporary (10s) footer status
+  unreachable (or rejects auth), probes the other configured servers'
+  `/models` live; only if one answers with models does it rescan and fall
+  back: the first serving the same model id, else the first with any models
+  (its first id alphabetically). If none does, nothing changes — the
+  selection and registered providers are left as they were. Shows a temporary (10s) footer status
   and syncs `enabledModels` / project `defaultModel` (see above). A manual
   selection made during the check is preserved. Non-local models, servers
   answering with no models, the case where no other server is reachable, and

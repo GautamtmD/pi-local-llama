@@ -155,8 +155,15 @@ try {
 		served = [];
 		await prompt();
 		down = true;
-		// The rescan for a fallback unregisters the down provider, as the next poll would.
-		try { await assert.rejects(prompt(), /No API key/); } finally { down = false; }
+		// No other server is live, so nothing changes: the provider stays registered.
+		try { await prompt(); } finally { down = false; }
+		assert.ok(registry.find(PROVIDER, "gemma:9b"));
+		// A live server with an empty model list is not a fallback either.
+		B.served = []; B.down = false;
+		down = true;
+		try { await prompt(); } finally { down = false; B.down = true; }
+		assert.ok(registry.find(PROVIDER, "gemma:9b"));
+		assert.equal(registry.find(B.provider, "b-first"), undefined);
 		assert.equal(currentModel.id, "gemma:9b");
 		assert.equal(setModelCalls, calls);
 	});

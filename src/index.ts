@@ -1174,7 +1174,9 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 				const selected = ctx.model;
 				return ctx.isIdle() && selected?.provider === current.provider && selected.id === current.id;
 			};
-			const server = normalizeServer(withCredential(configured, (await readCredentials()) ?? {}));
+			const keys = (await readCredentials()) ?? {};
+			const server = normalizeServer(withCredential(configured, keys));
+			const hasModels = (r: DiscoverResult) => r.ok && modelIdsKey(r.models) !== "";
 
 			// Check the server live rather than trusting the last poll, which may
 			// be up to pollIntervalMs old.
@@ -1184,6 +1186,14 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 				const liveIds = modelIdsKey(live.models).split("\n").filter(Boolean);
 				if (!liveIds.length) return;
 				if (liveIds.includes(current.id) && registered.has(current.provider)) return;
+			} else {
+				// Only act once another configured server is confirmed live with
+				// models; otherwise leave the selection and registry untouched.
+				const others = state.config.servers
+					.map((s) => normalizeServer(withCredential(s, keys)))
+					.filter((s) => s.providerName !== current.provider);
+				const probes = await Promise.all(others.map((s) => discoverModels(s, state.config.timeoutMs)));
+				if (!stillSelected() || !probes.some(hasModels)) return;
 			}
 
 			// Restore registration/auth even if the server came back with the same
