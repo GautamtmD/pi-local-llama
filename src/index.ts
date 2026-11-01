@@ -106,6 +106,11 @@ const THINKING_SUFFIXES = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const SETTINGS_LOCK_STALE_MS = 10000;
 const SETTINGS_LOCK_ATTEMPTS = 50;
 const SETTINGS_LOCK_DELAY_MS = 20;
+/** File names under `<agentDir>` (global) or `<cwd>/.pi` (project). */
+const SERVERS_FILE = "local-llama-servers.json";
+const SETTINGS_FILE = "settings.json";
+const CREDENTIALS_FILE = "local-llama-credentials.json";
+const STATUS_KEY = "local-llama";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -148,9 +153,11 @@ interface NormalizedServer extends ServerConfig {
 	displayName: string;
 }
 
+type AuthKind = "missing" | "rejected";
+
 interface RegisteredEntry {
 	server: NormalizedServer;
-	modelIdsKey: string; // sorted, newline-joined model ids; "" if none
+	modelIds: string[]; // sorted model ids; empty if none
 	signature: string; // ids + contextWindow + maxTokens; change triggers re-register
 	apiKey: string; // compare in memory so key replacement refreshes inference credentials
 	baseUrl: string; // effective URL registered with pi (may be a loopback fallback)
@@ -174,7 +181,7 @@ interface DiscoverOk {
 interface DiscoverFail {
 	ok: false;
 	error: string;
-	auth?: "missing" | "rejected";
+	auth?: AuthKind;
 }
 type DiscoverResult = DiscoverOk | DiscoverFail;
 
@@ -184,7 +191,7 @@ interface RefreshSummary {
 	removed: { server: NormalizedServer; reason: string }[];
 	up: { server: NormalizedServer; count: number }[];
 	down: { server: NormalizedServer; error: string }[];
-	auth: { server: NormalizedServer; kind: "missing" | "rejected" }[];
+	auth: { server: NormalizedServer; kind: AuthKind }[];
 	rerouted: { server: NormalizedServer; baseUrl: string; reason: string }[];
 }
 
@@ -210,9 +217,17 @@ function errMsg(e: unknown): string {
 	return String(e);
 }
 
-function num(v: unknown, fallback: number): number {
-	if (typeof v === "number" && Number.isFinite(v) && v > 0) return Math.floor(v);
-	return fallback;
+function readPositiveInt(v: unknown): number | undefined {
+	return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : undefined;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+	return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+/** `<agentDir>/<file>` (global) or `<cwd>/.pi/<file>` (project). */
+function configFilePath(scope: "global" | "project", cwd: string, file: string): string {
+	return scope === "global" ? join(getAgentDir(), file) : join(cwd, CONFIG_DIR_NAME, file);
 }
 
 /** Lowercase, `[a-z0-9-]` only; collapses other runs into a single dash. */
@@ -259,40 +274,72 @@ async function readJsonFile(path: string): Promise<unknown | null> {
 	}
 }
 
+/**
+ * Read a JSON object file we may rewrite: `{}` when missing, null when it is
+ * unreadable or not an object (callers must then refuse to write it).
+ */
+async function readJsonObject(path: string): Promise<Record<string, unknown> | null> {
+	const raw = await readJsonFile(path);
+	if (raw === null) return {};
+	if (!isPlainObject(raw)) {
+		console.error(`[pi-local-llama] ${path} is not a JSON object; leaving it untouched`);
+		return null;
+	}
+	return raw;
+}
+
+/**
+ * Write atomically (tmp + rename) so a concurrent reader — including pi's own
+ * settings handling — never sees a half-written file.
+ */
+async function writeJsonObject(path: string, obj: Record<string, unknown>): Promise<void> {
+	const tmp = `${path}.tmp`;
+	await writeFile(tmp, `${JSON.stringify(obj, null, 2)}\n`, "utf8");
+	await rename(tmp, path);
+}
+
 // ---------------------------------------------------------------------------
 // Config loading & merging
 // ---------------------------------------------------------------------------
 
-function coerceServer(entry: unknown): ServerConfig | undefined {
-	if (typeof entry === "string") {
-		const baseUrl = normalizeBaseUrl(entry);
-		return baseUrl ? { baseUrl } : undefined;
-	}
+/** Extract/normalize the baseUrl from a server entry (string or object). */
+function serverEntryUrl(entry: unknown): string | undefined {
+	if (typeof entry === "string") return normalizeBaseUrl(entry);
 	if (entry && typeof entry === "object") {
 		const obj = entry as Record<string, unknown>;
-		const baseUrl = normalizeBaseUrl(String(obj.baseUrl ?? obj.url ?? ""));
-		if (!baseUrl) return undefined;
-		const server: ServerConfig = { baseUrl };
-		if (typeof obj.apiKey === "string") server.apiKey = obj.apiKey;
-		if (typeof obj.name === "string") server.name = obj.name;
-		if (typeof obj.provider === "string") server.provider = obj.provider;
-		if (obj.compat && typeof obj.compat === "object") {
-			server.compat = { ...(obj.compat as ServerCompat) };
-		}
-		if (Array.isArray(obj.input)) {
-			const input = obj.input.filter((x): x is "text" | "image" => x === "text" || x === "image");
-			if (input.length) server.input = input;
-		}
-		if (typeof obj.reasoning === "boolean") server.reasoning = obj.reasoning;
-		if (typeof obj.maxTokens === "number" && Number.isFinite(obj.maxTokens) && obj.maxTokens > 0) {
-			server.maxTokens = Math.floor(obj.maxTokens);
-		}
-		if (obj.thinkingLevelMap && typeof obj.thinkingLevelMap === "object") {
-			server.thinkingLevelMap = { ...(obj.thinkingLevelMap as Record<string, string | null>) };
-		}
-		return server;
+		return normalizeBaseUrl(String(obj.baseUrl ?? obj.url ?? ""));
 	}
 	return undefined;
+}
+
+function coerceServer(entry: unknown): ServerConfig | undefined {
+	const baseUrl = serverEntryUrl(entry);
+	if (!baseUrl) return undefined;
+	if (typeof entry === "string") return { baseUrl };
+
+	const obj = entry as Record<string, unknown>;
+	const server: ServerConfig = { baseUrl };
+	if (typeof obj.apiKey === "string") server.apiKey = obj.apiKey;
+	if (typeof obj.name === "string") server.name = obj.name;
+	if (typeof obj.provider === "string") server.provider = obj.provider;
+	if (obj.compat && typeof obj.compat === "object") {
+		server.compat = { ...(obj.compat as ServerCompat) };
+	}
+	if (Array.isArray(obj.input)) {
+		const input = obj.input.filter((x): x is "text" | "image" => x === "text" || x === "image");
+		if (input.length) server.input = input;
+	}
+	if (typeof obj.reasoning === "boolean") server.reasoning = obj.reasoning;
+	const maxTokens = readPositiveInt(obj.maxTokens);
+	if (maxTokens) server.maxTokens = maxTokens;
+	if (obj.thinkingLevelMap && typeof obj.thinkingLevelMap === "object") {
+		server.thinkingLevelMap = { ...(obj.thinkingLevelMap as Record<string, string | null>) };
+	}
+	return server;
+}
+
+function coerceServers(list: unknown[]): ServerConfig[] {
+	return list.map(coerceServer).filter((s): s is ServerConfig => s !== undefined);
 }
 
 function coerceConfig(raw: unknown): Config {
@@ -311,55 +358,41 @@ function coerceConfig(raw: unknown): Config {
 	if (obj.scopeSettings === "project") cfg.scopeSettings = "project";
 	else if (obj.scopeSettings === "global") cfg.scopeSettings = "global";
 
-	const serverList = Array.isArray(obj.servers) ? obj.servers : [];
-	cfg.servers = serverList
-		.map(coerceServer)
-		.filter((s): s is ServerConfig => s !== undefined);
-
+	cfg.servers = coerceServers(Array.isArray(obj.servers) ? obj.servers : []);
 	return cfg;
 }
 
-/** Merge configs: servers accumulate (later `override` wins per baseUrl); scalars override. */
+/**
+ * Merge configs: servers accumulate (later `override` wins per baseUrl).
+ * Scalars come from `override` only if it contributed a server; either side
+ * can disable `discoverAtStartup`.
+ */
 function mergeConfigs(base: Config, override: Config): Config {
 	const byUrl = new Map<string, ServerConfig>();
 	for (const s of base.servers) byUrl.set(s.baseUrl, s);
 	for (const s of override.servers) byUrl.set(s.baseUrl, s);
-	const useOverrideScalars = override.servers.length > 0;
+	const scalars = override.servers.length > 0 ? override : base;
 	return {
+		...scalars,
 		servers: [...byUrl.values()],
-		pollIntervalMs: useOverrideScalars ? override.pollIntervalMs : base.pollIntervalMs,
-		timeoutMs: useOverrideScalars ? override.timeoutMs : base.timeoutMs,
-		notify: useOverrideScalars ? override.notify : base.notify,
-		status: useOverrideScalars ? override.status : base.status,
 		discoverAtStartup: base.discoverAtStartup && override.discoverAtStartup,
-		autoScopePattern: useOverrideScalars ? override.autoScopePattern : base.autoScopePattern,
-		scopeSettings: useOverrideScalars ? override.scopeSettings : base.scopeSettings,
-		scopePattern: useOverrideScalars ? override.scopePattern : base.scopePattern,
-		autoSwitchModel: useOverrideScalars ? override.autoSwitchModel : base.autoSwitchModel,
 	};
 }
 
-async function loadGlobalConfig(): Promise<Config> {
-	const path = join(getAgentDir(), "local-llama-servers.json");
-	return coerceConfig(await readJsonFile(path));
+/** Config file for the global (no cwd needed) or a project scope. */
+async function loadConfigFile(scope: "global" | "project", cwd = ""): Promise<Config> {
+	return coerceConfig(await readJsonFile(configFilePath(scope, cwd, SERVERS_FILE)));
 }
 
 function loadEnvConfig(): Config {
-	const env = process.env.PI_LOCAL_SERVERS;
-	if (!env) return { ...DEFAULTS, servers: [] };
-	const urls = env.split(",").map((s) => s.trim()).filter(Boolean);
-	return { ...DEFAULTS, servers: urls.map(coerceServer).filter((s): s is ServerConfig => !!s) };
-}
-
-async function loadProjectConfig(cwd: string): Promise<Config> {
-	const path = join(cwd, CONFIG_DIR_NAME, "local-llama-servers.json");
-	return coerceConfig(await readJsonFile(path));
+	const urls = (process.env.PI_LOCAL_SERVERS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+	return { ...DEFAULTS, servers: coerceServers(urls) };
 }
 
 /** Recompute the effective config from global + env + (trusted) project sources. */
 async function computeConfig(ctx: { cwd: string; isProjectTrusted(): boolean }): Promise<Config> {
-	let cfg = mergeConfigs(await loadGlobalConfig(), loadEnvConfig());
-	if (ctx.isProjectTrusted()) cfg = mergeConfigs(cfg, await loadProjectConfig(ctx.cwd));
+	let cfg = mergeConfigs(await loadConfigFile("global"), loadEnvConfig());
+	if (ctx.isProjectTrusted()) cfg = mergeConfigs(cfg, await loadConfigFile("project", ctx.cwd));
 	return cfg;
 }
 
@@ -368,7 +401,7 @@ async function computeConfig(ctx: { cwd: string; isProjectTrusted(): boolean }):
 // ---------------------------------------------------------------------------
 
 function credentialsPath(): string {
-	return join(getAgentDir(), "local-llama-credentials.json");
+	return configFilePath("global", "", CREDENTIALS_FILE);
 }
 
 /** Return null for a broken/unreadable store so commands never overwrite it. */
@@ -429,81 +462,53 @@ function withCredential(server: ServerConfig, keys: Record<string, string>): Ser
 // local-llama-servers.json management (the polled server list)
 // ---------------------------------------------------------------------------
 
-function serversConfigPath(scope: "global" | "project", cwd: string): string {
-	return scope === "global"
-		? join(getAgentDir(), "local-llama-servers.json")
-		: join(cwd, CONFIG_DIR_NAME, "local-llama-servers.json");
-}
-
-/** Extract/normalize the baseUrl from a stored server entry (string or object). */
-function storedServerUrl(entry: unknown): string | undefined {
-	if (typeof entry === "string") return normalizeBaseUrl(entry);
-	if (entry && typeof entry === "object") {
-		const obj = entry as Record<string, unknown>;
-		return normalizeBaseUrl(String(obj.baseUrl ?? obj.url ?? ""));
-	}
-	return undefined;
-}
-
-async function readServersObject(path: string): Promise<Record<string, unknown> | null> {
-	const raw = await readJsonFile(path);
-	if (raw === null) return {}; // missing file -> empty
-	if (typeof raw !== "object" || Array.isArray(raw)) {
-		console.error(`[pi-local-llama] ${path} is not a JSON object; leaving it untouched`);
-		return null;
-	}
-	return raw as Record<string, unknown>;
-}
-
-interface AddServerResult {
+interface ServerEditResult {
 	changed: boolean;
 	baseUrl?: string;
 	reason: string;
 }
 
-async function addServer(path: string, input: string): Promise<AddServerResult> {
+/**
+ * Read the server list at `path`, let `edit` return the new list (or a
+ * reason it is unchanged), and write it back. An empty list drops the key.
+ */
+async function editServerList(
+	path: string,
+	input: string,
+	edit: (servers: unknown[], baseUrl: string) => { next: unknown[]; reason: string } | string,
+): Promise<ServerEditResult> {
 	const baseUrl = normalizeBaseUrl(input);
 	if (!baseUrl) return { changed: false, reason: `invalid URL: "${input}"` };
-	const cfg = await readServersObject(path);
+	const cfg = await readJsonObject(path);
 	if (!cfg) return { changed: false, reason: `${path} is unreadable` };
 
-	const servers = Array.isArray(cfg.servers) ? cfg.servers : [];
-	if (servers.some((s) => storedServerUrl(s) === baseUrl)) {
-		return { changed: false, baseUrl, reason: `already configured` };
-	}
-	cfg.servers = [...servers, baseUrl];
-	await writeSettingsObject(path, cfg);
-	return { changed: true, baseUrl, reason: "added" };
+	const result = edit(Array.isArray(cfg.servers) ? cfg.servers : [], baseUrl);
+	if (typeof result === "string") return { changed: false, baseUrl, reason: result };
+	if (result.next.length === 0) delete cfg.servers;
+	else cfg.servers = result.next;
+	await writeJsonObject(path, cfg);
+	return { changed: true, baseUrl, reason: result.reason };
 }
 
-interface RemoveServerResult {
-	changed: boolean;
-	baseUrl?: string;
-	reason: string;
+function addServer(path: string, input: string): Promise<ServerEditResult> {
+	return editServerList(path, input, (servers, baseUrl) =>
+		servers.some((s) => serverEntryUrl(s) === baseUrl)
+			? "already configured"
+			: { next: [...servers, baseUrl], reason: "added" });
 }
 
-async function removeServer(path: string, input: string): Promise<RemoveServerResult> {
-	const baseUrl = normalizeBaseUrl(input);
-	if (!baseUrl) return { changed: false, reason: `invalid URL: "${input}"` };
-	const cfg = await readServersObject(path);
-	if (!cfg) return { changed: false, reason: `${path} is unreadable` };
-
-	const servers = Array.isArray(cfg.servers) ? cfg.servers : [];
-	const next = servers.filter((s) => storedServerUrl(s) !== baseUrl);
-	if (next.length === servers.length) {
-		return { changed: false, baseUrl, reason: `not found` };
-	}
-	if (next.length === 0) delete cfg.servers;
-	else cfg.servers = next;
-	await writeSettingsObject(path, cfg);
-	return { changed: true, baseUrl, reason: "removed" };
+function removeServer(path: string, input: string): Promise<ServerEditResult> {
+	return editServerList(path, input, (servers, baseUrl) => {
+		const next = servers.filter((s) => serverEntryUrl(s) !== baseUrl);
+		return next.length === servers.length ? "not found" : { next, reason: "removed" };
+	});
 }
 
 async function listServers(path: string): Promise<{ url: string; raw: unknown }[]> {
-	const cfg = await readServersObject(path);
+	const cfg = await readJsonObject(path);
 	const servers = Array.isArray(cfg?.servers) ? cfg.servers : [];
 	return servers
-		.map((s) => ({ raw: s, url: storedServerUrl(s) ?? String(s) }))
+		.map((s) => ({ raw: s, url: serverEntryUrl(s) ?? String(s) }))
 		.filter((s) => s.url);
 }
 
@@ -512,27 +517,13 @@ async function listServers(path: string): Promise<{ url: string; raw: unknown }[
 // ---------------------------------------------------------------------------
 
 function settingsFilePath(scope: "global" | "project", cwd: string): string {
-	return scope === "global"
-		? join(getAgentDir(), "settings.json")
-		: join(cwd, CONFIG_DIR_NAME, "settings.json");
+	return configFilePath(scope, cwd, SETTINGS_FILE);
 }
 
-async function readSettingsObject(path: string): Promise<Record<string, unknown> | null> {
-	const raw = await readJsonFile(path);
-	if (raw === null) return {}; // missing file -> treat as empty
-	if (typeof raw !== "object" || Array.isArray(raw)) {
-		console.error(`[pi-local-llama] ${path} is not a JSON object; leaving it untouched`);
-		return null; // unreadable/invalid -> refuse to write
-	}
-	return raw as Record<string, unknown>;
-}
-
-/** Write atomically (tmp + rename) to reduce races with pi's own settings writes. */
-async function writeSettingsObject(path: string, obj: Record<string, unknown>): Promise<void> {
-	const text = `${JSON.stringify(obj, null, 2)}\n`;
-	const tmp = `${path}.tmp`;
-	await writeFile(tmp, text, "utf8");
-	await rename(tmp, path);
+/** The string entries of a settings object's `enabledModels`. */
+function enabledModelStrings(settings: Record<string, unknown> | null): string[] {
+	const cur = settings?.enabledModels;
+	return Array.isArray(cur) ? cur.filter((p): p is string => typeof p === "string") : [];
 }
 
 type ScopeMode = "always" | "if-empty";
@@ -543,20 +534,18 @@ interface EnsureResult {
 }
 
 async function ensureScopePattern(path: string, pattern: string, mode: ScopeMode): Promise<EnsureResult> {
-	const settings = await readSettingsObject(path);
+	const settings = await readJsonObject(path);
 	if (!settings) return { changed: false, reason: "settings unreadable" };
 
 	const cur = settings.enabledModels;
-	if (Array.isArray(cur) && cur.some((p) => typeof p === "string" && p === pattern)) {
-		return { changed: false, reason: "already present" };
-	}
+	const strings = enabledModelStrings(settings);
+	if (strings.includes(pattern)) return { changed: false, reason: "already present" };
 	if (mode === "if-empty" && Array.isArray(cur) && cur.length > 0) {
 		return { changed: false, reason: "user has existing enabledModels" };
 	}
 
-	const strings = (Array.isArray(cur) ? cur : []).filter((p): p is string => typeof p === "string");
 	settings.enabledModels = [...strings, pattern];
-	await writeSettingsObject(path, settings);
+	await writeJsonObject(path, settings);
 	return { changed: true, reason: "added" };
 }
 
@@ -566,26 +555,25 @@ interface RemoveResult {
 }
 
 async function removeScopePattern(path: string, pattern: string): Promise<RemoveResult> {
-	const settings = await readSettingsObject(path);
+	const settings = await readJsonObject(path);
 	if (!settings) return { changed: false, remaining: 0 };
 
 	const cur = settings.enabledModels;
-	if (!Array.isArray(cur) || !cur.some((p) => typeof p === "string" && p === pattern)) {
+	const strings = enabledModelStrings(settings);
+	if (!strings.includes(pattern)) {
 		return { changed: false, remaining: Array.isArray(cur) ? cur.length : 0 };
 	}
 
-	const next = cur.filter((p) => typeof p === "string" && p !== pattern);
+	const next = strings.filter((p) => p !== pattern);
 	if (next.length === 0) delete settings.enabledModels;
 	else settings.enabledModels = next;
-	await writeSettingsObject(path, settings);
+	await writeJsonObject(path, settings);
 	return { changed: true, remaining: next.length };
 }
 
 async function scopePatternStatus(path: string, pattern: string): Promise<{ present: boolean; enabledModels: string[] }> {
-	const settings = await readSettingsObject(path);
-	const cur = settings?.enabledModels;
-	const arr = Array.isArray(cur) ? cur.filter((p): p is string => typeof p === "string") : [];
-	return { present: arr.includes(pattern), enabledModels: arr };
+	const enabledModels = enabledModelStrings(await readJsonObject(path));
+	return { present: enabledModels.includes(pattern), enabledModels };
 }
 
 // ---------------------------------------------------------------------------
@@ -635,8 +623,8 @@ async function withSettingsLock<T>(path: string, fn: () => T): Promise<T> {
 	}
 }
 
-/** Synchronous readSettingsObject() for use while holding the settings lock. */
-function readSettingsObjectSync(path: string): Record<string, unknown> | null {
+/** Synchronous readJsonObject() for use while holding the settings lock. */
+function readJsonObjectSync(path: string): Record<string, unknown> | null {
 	let raw: unknown;
 	try {
 		raw = JSON.parse(readFileSync(path, "utf8"));
@@ -645,8 +633,7 @@ function readSettingsObjectSync(path: string): Record<string, unknown> | null {
 		console.error(`[pi-local-llama] failed to read ${path}: ${errMsg(e)}`);
 		return null;
 	}
-	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-	return raw as Record<string, unknown>;
+	return isPlainObject(raw) ? raw : null;
 }
 
 /**
@@ -722,10 +709,10 @@ async function syncSwitchedModel(
 	};
 
 	// Cheap unlocked check first: most settings files need no change.
-	const preview = await readSettingsObject(path);
+	const preview = await readJsonObject(path);
 	if (!preview || !update(preview)) return false;
 	return withSettingsLock(path, () => {
-		const settings = readSettingsObjectSync(path);
+		const settings = readJsonObjectSync(path);
 		if (!settings || !update(settings)) return false;
 		const tmp = `${path}.tmp`;
 		writeFileSync(tmp, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
@@ -757,29 +744,16 @@ function normalizeServer(server: ServerConfig): NormalizedServer {
 // Discovery
 // ---------------------------------------------------------------------------
 
-function timeoutSignal(ms: number): AbortSignal {
-	if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
-		return AbortSignal.timeout(ms);
-	}
-	const controller = new AbortController();
-	setTimeout(() => controller.abort(), ms);
-	return controller.signal;
-}
-
-async function fetchWithTimeout(
-	url: string,
-	init: RequestInit,
-	timeoutMs: number,
-): Promise<Response> {
-	return fetch(url, { ...init, signal: timeoutSignal(timeoutMs) });
+/** GET a JSON endpoint with an optional Bearer key and a hard timeout. */
+function fetchJson(url: string, apiKey: string | undefined, timeoutMs: number): Promise<Response> {
+	const headers: Record<string, string> = { accept: "application/json" };
+	if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+	return fetch(url, { method: "GET", headers, signal: AbortSignal.timeout(timeoutMs) });
 }
 
 async function discoverModelsAt(baseUrl: string, apiKey: string | undefined, timeoutMs: number): Promise<DiscoverResult> {
 	try {
-		const headers: Record<string, string> = { accept: "application/json" };
-		if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-
-		const res = await fetchWithTimeout(`${baseUrl}/models`, { method: "GET", headers }, timeoutMs);
+		const res = await fetchJson(`${baseUrl}/models`, apiKey, timeoutMs);
 		if (!res.ok) return {
 			ok: false,
 			error: `HTTP ${res.status}`,
@@ -847,18 +821,12 @@ async function discoverModels(server: NormalizedServer, timeoutMs: number): Prom
  */
 async function getJson(url: string, timeoutMs: number, apiKey?: string): Promise<unknown | null> {
 	try {
-		const headers: Record<string, string> = { accept: "application/json" };
-		if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-		const res = await fetchWithTimeout(url, { method: "GET", headers }, timeoutMs);
+		const res = await fetchJson(url, apiKey, timeoutMs);
 		if (!res.ok) return null;
 		return await res.json().catch(() => null);
 	} catch {
 		return null;
 	}
-}
-
-function readPositiveInt(v: unknown): number | undefined {
-	return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : undefined;
 }
 
 /** Pull the per-slot running context out of llama-server's /props payload. */
@@ -943,7 +911,7 @@ function toModelDefinition(raw: RawModel, server: NormalizedServer, serverCtx: n
 		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: resolveContextWindow(raw, serverCtx),
-		maxTokens: server.maxTokens ?? num(raw.max_tokens, 8192),
+		maxTokens: server.maxTokens ?? readPositiveInt(raw.max_tokens) ?? 8192,
 		...(server.thinkingLevelMap ? { thinkingLevelMap: server.thinkingLevelMap } : {}),
 		compat: {
 			// Safe defaults for OpenAI-compatible local servers (Ollama, vLLM,
@@ -971,12 +939,12 @@ function buildProviderConfig(
 	};
 }
 
-function modelIdsKey(models: RawModel[]): string {
+/** Sorted, non-empty model ids from a /models payload. */
+function modelIdList(models: RawModel[]): string[] {
 	return models
 		.map((m) => String(m.id ?? m.name ?? ""))
 		.filter(Boolean)
-		.sort()
-		.join("\n");
+		.sort();
 }
 
 /**
@@ -1006,11 +974,32 @@ interface CtxLike {
 	hasUI?: boolean;
 }
 
+/** Short state labels, shared by the footer, notices and `/local-llama-servers list`. */
+const AUTH_LABEL: Record<AuthKind, string> = { missing: "needs API key", rejected: "key rejected" };
+/** Why a provider was unregistered after an auth failure. */
+const AUTH_REMOVED_REASON: Record<AuthKind, string> = { missing: "API key required", rejected: "API key rejected" };
+
+/** e.g. ["1 needs API key", "2 key rejected"], omitting zero counts. */
+function authCountParts(auth: { kind: AuthKind }[]): string[] {
+	const parts: string[] = [];
+	for (const kind of ["missing", "rejected"] as const) {
+		const count = auth.filter((a) => a.kind === kind).length;
+		if (count) parts.push(`${count} ${AUTH_LABEL[kind]}`);
+	}
+	return parts;
+}
+
+function totalModelCount(registered: Map<string, RegisteredEntry>): number {
+	let total = 0;
+	for (const e of registered.values()) total += e.modelIds.length;
+	return total;
+}
+
 async function refresh(
 	pi: ExtensionAPI,
 	config: Config,
 	registered: Map<string, RegisteredEntry>,
-	authStates: Map<string, "missing" | "rejected">,
+	authStates: Map<string, AuthKind>,
 	ctx?: CtxLike,
 	keep?: string, // provider left registered even if down (the next poll removes it)
 ): Promise<RefreshSummary> {
@@ -1052,9 +1041,14 @@ async function refresh(
 		if (result.ok) {
 			const providerConfig = buildProviderConfig(server, result.models, serverCtx, result.baseUrl);
 			const signature = providerSignature(providerConfig.models);
-			const idsKey = modelIdsKey(result.models);
 			const prev = registered.get(server.providerName);
-			const entry = { server, modelIdsKey: idsKey, signature, apiKey: providerConfig.apiKey, baseUrl: result.baseUrl };
+			const entry: RegisteredEntry = {
+				server,
+				modelIds: modelIdList(result.models),
+				signature,
+				apiKey: providerConfig.apiKey,
+				baseUrl: result.baseUrl,
+			};
 			if (!prev) {
 				pi.registerProvider(server.providerName, providerConfig);
 				registered.set(server.providerName, entry);
@@ -1078,7 +1072,7 @@ async function refresh(
 			if (prev && server.providerName !== keep) {
 				pi.unregisterProvider(server.providerName);
 				registered.delete(server.providerName);
-				summary.removed.push({ server, reason: result.auth === "missing" ? "API key required" : result.auth === "rejected" ? "API key rejected" : result.error });
+				summary.removed.push({ server, reason: result.auth ? AUTH_REMOVED_REASON[result.auth] : result.error });
 			}
 			if (result.auth) {
 				summary.auth.push({ server, kind: result.auth });
@@ -1109,7 +1103,7 @@ function emitNotifications(
 	ctx: CtxLike | undefined,
 	config: Config,
 	summary: RefreshSummary,
-	authStates: Map<string, "missing" | "rejected">,
+	authStates: Map<string, AuthKind>,
 ): void {
 	if (!config.notify || !ctx?.hasUI || !ctx.ui?.notify) return;
 
@@ -1149,47 +1143,31 @@ function emitStatus(
 	if (!config.status || !ctx?.hasUI || !ctx.ui?.setStatus) return;
 
 	if (registered.size === 0 && summary.down.length === 0 && summary.auth.length === 0) {
-		ctx.ui.setStatus("local-llama", undefined);
+		ctx.ui.setStatus(STATUS_KEY, undefined);
 		return;
 	}
 
-	const totalModels = [...registered.values()].reduce(
-		(acc, e) => acc + e.modelIdsKey.split("\n").filter(Boolean).length,
-		0,
-	);
 	const parts: string[] = [];
-	if (registered.size) parts.push(`${registered.size} up (${totalModels} models)`);
+	if (registered.size) parts.push(`${registered.size} up (${totalModelCount(registered)} models)`);
 	if (summary.down.length) parts.push(`${summary.down.length} down`);
-	const missing = summary.auth.filter((a) => a.kind === "missing").length;
-	const rejected = summary.auth.length - missing;
-	if (missing) parts.push(`${missing} needs API key`);
-	if (rejected) parts.push(`${rejected} key rejected`);
-	ctx.ui.setStatus("local-llama", `🦙 ${parts.join(", ")}`);
+	parts.push(...authCountParts(summary.auth));
+	ctx.ui.setStatus(STATUS_KEY, `🦙 ${parts.join(", ")}`);
 }
 
 function emitStartupSummary(
 	ctx: CtxLike | undefined,
 	config: Config,
 	registered: Map<string, RegisteredEntry>,
-	down: { server: NormalizedServer; error: string }[],
-	auth: { server: NormalizedServer; kind: "missing" | "rejected" }[],
+	{ down, auth }: RefreshSummary,
 ): void {
 	if (!config.notify || !ctx?.hasUI || !ctx.ui?.notify) return;
-	const entries = [...registered.values()];
-	if (!entries.length && !down.length && !auth.length) return;
+	if (!registered.size && !down.length && !auth.length) return;
 
-	const totalModels = entries.reduce(
-		(acc, e) => acc + e.modelIdsKey.split("\n").filter(Boolean).length,
-		0,
-	);
 	const bits: string[] = [];
-	if (entries.length) bits.push(`${entries.length} server(s) up, ${totalModels} model(s)`);
+	if (registered.size) bits.push(`${registered.size} server(s) up, ${totalModelCount(registered)} model(s)`);
 	if (down.length) bits.push(`${down.length} down`);
-	const missing = auth.filter((a) => a.kind === "missing").length;
-	const rejected = auth.length - missing;
-	if (missing) bits.push(`${missing} needs API key`);
-	if (rejected) bits.push(`${rejected} key rejected`);
-	const rerouted = entries.filter((e) => e.baseUrl !== e.server.baseUrl);
+	bits.push(...authCountParts(auth));
+	const rerouted = [...registered.values()].filter((e) => e.baseUrl !== e.server.baseUrl);
 	for (const e of rerouted) {
 		bits.push(`${e.server.baseUrl} is answered by another program; using ${e.baseUrl}`);
 	}
@@ -1197,18 +1175,53 @@ function emitStartupSummary(
 }
 
 // ---------------------------------------------------------------------------
+// Auto-switch target selection
+// ---------------------------------------------------------------------------
+
+interface SwitchTarget {
+	entry: RegisteredEntry;
+	id: string;
+}
+
+/**
+ * Pick the model to switch to after reconciliation.
+ *   - Own server live: its first model alphabetically, unless it still serves
+ *     `current.id` (then nothing to do).
+ *   - Own server down: another configured server serving the same id, else
+ *     the first reachable one (config order) with its first model.
+ */
+function pickSwitchTarget(
+	current: ModelRef,
+	ownServerLive: boolean,
+	servers: ServerConfig[],
+	registered: Map<string, RegisteredEntry>,
+): SwitchTarget | undefined {
+	if (ownServerLive) {
+		const own = registered.get(current.provider);
+		if (!own?.modelIds.length || own.modelIds.includes(current.id)) return undefined;
+		return { entry: own, id: own.modelIds[0] };
+	}
+	const others = servers
+		.map((s) => registered.get(normalizeServer(s).providerName))
+		.filter((e): e is RegisteredEntry => !!e && e.server.providerName !== current.provider && e.modelIds.length > 0);
+	const same = others.find((e) => e.modelIds.includes(current.id));
+	if (same) return { entry: same, id: current.id };
+	return others.length ? { entry: others[0], id: others[0].modelIds[0] } : undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
 export default async function localLlamaExtension(pi: ExtensionAPI): Promise<void> {
-	const baseConfig = mergeConfigs(await loadGlobalConfig(), loadEnvConfig());
+	const baseConfig = mergeConfigs(await loadConfigFile("global"), loadEnvConfig());
 
 	// Mutable runtime config (updated at session_start when project config is merged in).
 	const state: { config: Config } = { config: baseConfig };
 
 	// Providers we currently have registered (process-global ModelRegistry).
 	const registered = new Map<string, RegisteredEntry>();
-	const authStates = new Map<string, "missing" | "rejected">();
+	const authStates = new Map<string, AuthKind>();
 	// A command can rescan while a poll is in flight; apply results in order.
 	let pendingRefresh: Promise<void> = Promise.resolve();
 	function runRefresh(config: Config, ctx?: CtxLike, keep?: string): Promise<RefreshSummary> {
@@ -1254,7 +1267,7 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 
 		// Immediate reconcile + startup notice.
 		const summary = await runRefresh(config, ctx);
-		if (ctx.hasUI) emitStartupSummary(ctx, config, registered, summary.down, summary.auth);
+		emitStartupSummary(ctx, config, registered, summary);
 
 		if (timer) clearInterval(timer);
 		if (config.servers.length && config.pollIntervalMs > 0) {
@@ -1274,6 +1287,24 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 	// provider that polling removed during a restart. Do not change models for
 	// input queued while an agent is already running.
 	let switchStatusTimer: ReturnType<typeof setTimeout> | undefined;
+	function clearSwitchStatusTimer(): void {
+		if (switchStatusTimer) clearTimeout(switchStatusTimer);
+		switchStatusTimer = undefined;
+	}
+	/** Show a temporary footer status that clears itself after SWITCH_STATUS_MS. */
+	function flashSwitchStatus(ctx: { ui: { setStatus(key: string, text: string | undefined): void } }, text: string): void {
+		ctx.ui.setStatus(SWITCH_STATUS_KEY, text);
+		clearSwitchStatusTimer();
+		switchStatusTimer = setTimeout(() => {
+			switchStatusTimer = undefined;
+			try {
+				ctx.ui.setStatus(SWITCH_STATUS_KEY, undefined);
+			} catch {
+				/* session may have ended */
+			}
+		}, SWITCH_STATUS_MS);
+	}
+
 	pi.on("input", async (_event, ctx) => {
 		try {
 			if (!state.config.autoSwitchModel || !ctx.isIdle()) return;
@@ -1289,14 +1320,14 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 			};
 			const keys = (await readCredentials()) ?? {};
 			const server = normalizeServer(withCredential(configured, keys));
-			const hasModels = (r: DiscoverResult) => r.ok && modelIdsKey(r.models) !== "";
+			const hasModels = (r: DiscoverResult) => r.ok && modelIdList(r.models).length > 0;
 
 			// Check the server live rather than trusting the last poll, which may
 			// be up to pollIntervalMs old.
 			const live = await discoverModels(server, state.config.timeoutMs);
 			if (!stillSelected()) return;
 			if (live.ok) {
-				const liveIds = modelIdsKey(live.models).split("\n").filter(Boolean);
+				const liveIds = modelIdList(live.models);
 				if (!liveIds.length) return;
 				if (liveIds.includes(current.id) && registered.has(current.provider)) return;
 			} else {
@@ -1316,25 +1347,7 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 			// fallback vanishes before the switch; the next poll removes it.
 			await runRefresh(state.config, ctx, live.ok ? undefined : current.provider);
 			if (!stillSelected()) return; // preserve a manual selection made during I/O
-			const idsOf = (e: RegisteredEntry) => e.modelIdsKey.split("\n").filter(Boolean);
-			let target: { entry: RegisteredEntry; id: string } | undefined;
-			if (live.ok) {
-				const own = registered.get(current.provider);
-				if (!own) return;
-				const ids = idsOf(own);
-				if (!ids.length || ids.includes(current.id)) return;
-				target = { entry: own, id: ids[0] };
-			} else {
-				// The selected server is unavailable: fall back to another configured
-				// server, preferring one that serves the same model id, else the first
-				// reachable server (config order) with its first model alphabetically.
-				const others = state.config.servers
-					.map((s) => registered.get(normalizeServer(s).providerName))
-					.filter((e): e is RegisteredEntry => !!e && e.server.providerName !== current.provider && idsOf(e).length > 0);
-				const same = others.find((e) => idsOf(e).includes(current.id));
-				if (same) target = { entry: same, id: current.id };
-				else if (others.length) target = { entry: others[0], id: idsOf(others[0])[0] };
-			}
+			const target = pickSwitchTarget(current, live.ok, state.config.servers, registered);
 			if (!target) return;
 			const next = ctx.modelRegistry.find(target.entry.server.providerName, target.id);
 			if (!next || !(await pi.setModel(next))) return;
@@ -1353,21 +1366,10 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 			}
 
 			if (!ctx.hasUI || !state.config.status) return;
-			ctx.ui.setStatus(
-				SWITCH_STATUS_KEY,
-				sameServer
-					? `🦙 switched model: ${current.id} → ${next.id} (${target.entry.server.displayName})`
-					: `🦙 switched model: ${current.provider}/${current.id} → ${next.provider}/${next.id} (${target.entry.server.displayName})`,
-			);
-			if (switchStatusTimer) clearTimeout(switchStatusTimer);
-			switchStatusTimer = setTimeout(() => {
-				switchStatusTimer = undefined;
-				try {
-					ctx.ui.setStatus(SWITCH_STATUS_KEY, undefined);
-				} catch {
-					/* session may have ended */
-				}
-			}, SWITCH_STATUS_MS);
+			const via = target.entry.server.displayName;
+			flashSwitchStatus(ctx, sameServer
+				? `🦙 switched model: ${current.id} → ${next.id} (${via})`
+				: `🦙 switched model: ${current.provider}/${current.id} → ${next.provider}/${next.id} (${via})`);
 		} catch (e) {
 			console.error(`[pi-local-llama] model auto-switch failed: ${errMsg(e)}`);
 		}
@@ -1378,10 +1380,7 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 			clearInterval(timer);
 			timer = undefined;
 		}
-		if (switchStatusTimer) {
-			clearTimeout(switchStatusTimer);
-			switchStatusTimer = undefined;
-		}
+		clearSwitchStatusTimer();
 		// Intentionally do NOT unregister providers here: "model removed when
 		// server is killed" is handled by reachability polling. We also do NOT
 		// remove the scope pattern here — it must persist between sessions so it
@@ -1475,7 +1474,7 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 				ctx.ui.notify("local-llama: project not trusted; cannot write project config.", "warning");
 				return;
 			}
-			const path = serversConfigPath(scope, ctx.cwd);
+			const path = configFilePath(scope, ctx.cwd, SERVERS_FILE);
 
 			try {
 				if (sub === "key" || sub === "key-remove") {
@@ -1537,17 +1536,15 @@ export default async function localLlamaExtension(pi: ExtensionAPI): Promise<voi
 						return;
 					}
 					const lines = entries.map((e) => {
-						const sc = coerceServer(e.raw) ?? { baseUrl: e.url };
-						const provider = normalizeServer(sc).providerName;
+						const provider = normalizeServer(coerceServer(e.raw) ?? { baseUrl: e.url }).providerName;
 						const auth = authStates.get(provider);
-						return `${registered.has(provider) ? "up" : auth === "missing" ? "needs API key" : auth === "rejected" ? "key rejected" : "down"}  ${e.url}`;
+						const label = registered.has(provider) ? "up" : auth ? AUTH_LABEL[auth] : "down";
+						return `${label}  ${e.url}`;
 					});
-					ctx.ui.notify(`local-llama (${path}):
-${lines.join("\n")}`, "info");
+					ctx.ui.notify(`local-llama (${path}):\n${lines.join("\n")}`, "info");
 				} else {
 					ctx.ui.notify(
 						`local-llama: unknown subcommand "${sub}". Use add, remove, list, key, or key-remove.`,
-
 						"warning",
 					);
 				}

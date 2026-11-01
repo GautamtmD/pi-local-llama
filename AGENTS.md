@@ -137,8 +137,8 @@ Three things to internalize:
    `id:contextWindow:maxTokens` per model. `refresh()` re-registers whenever
    this signature changes, so relaunching llama-server with a different `-c`
    (which changes contextWindow) is picked up on the next poll without a
-   `/reload`. `modelIdsKey` is still kept on `RegisteredEntry`, but only for
-   counting models in the status footer. Note: changing ONLY `name`/`compat`
+   `/reload`. `RegisteredEntry.modelIds` (sorted ids) is used for
+   model counts and auto-switch targets, not change detection. Note: changing ONLY `name`/`compat`
    mid-session will NOT re-register — by design.
 3. **`refresh()` is the single source of truth** for register/unregister and
    for emitting notifications + footer status. Startup discovery, polling,
@@ -162,7 +162,7 @@ Three things to internalize:
 - **`session_shutdown` does NOT remove the scope pattern either.** It must
   persist between sessions so it's present at the next startup's scope
   resolution.
-- **settings.json writes are atomic** (tmp + rename) in `writeSettingsObject()`
+- **settings.json writes are atomic** (tmp + rename) in `writeJsonObject()`
   to avoid corrupting pi's own settings file on concurrent writes. Keep this.
 - **The extension never throws out of an event/command handler** in a way that
   would crash pi — discovery errors become `{ ok: false, error }` and are
@@ -269,11 +269,11 @@ certainly the cause, not a bug in this extension.
 | Provider registered but wrong name | `toProviderName()` / `sanitize()` / `PROVIDER_PREFIX` |
 | Provider not re-registered after a change | `providerSignature()` (ids + contextWindow + maxTokens). Changing only `name`/`compat` will NOT re-register — by design. |
 | Wrong / 128k context window shown | `discoverServerContext()` / `resolveContextWindow()`. Hit `<baseUrl>/props` and `<baseUrl>/slots` directly; confirm `meta.n_ctx`. `meta.n_ctx_train` is intentionally ignored. |
-| Server up but treated as down | `discoverModels()` error path; `timeoutMs`; `fetchWithTimeout`/`AbortSignal.timeout` |
+| Server up but treated as down | `discoverModels()` error path; `timeoutMs`; `fetchJson()` (`AbortSignal.timeout`) |
 | Works on `127.0.0.1`, not `localhost` / registered `baseUrl` is `127.0.0.1` | Another listener on `[::]`/`::1` on the same port (e.g. `python -m http.server`). `discoverModels()` → `loopbackAlternates()` fallback; `RegisteredEntry.baseUrl` |
 | Polling stopped / not running | `session_start` handler; `timer`/`clearInterval`; `config.servers.length` and `pollIntervalMs > 0` gate |
 | Scope pattern not added | `autoScopePattern`, `scopeSettings`, `isProjectTrusted()`, the `if-empty` mode in `ensureScopePattern()` |
-| settings.json corrupted / race | `writeSettingsObject()` (tmp+rename); pi writing concurrently |
+| settings.json corrupted / race | `writeJsonObject()` (tmp+rename); pi writing concurrently |
 | Wrong servers loaded | config merge order (global → env → project); a stale `local-llama-servers.json` |
 | Status footer wrong | `emitStatus()` / `emitNotifications()` / `emitStartupSummary()` |
 | Model not auto-switched after server relaunch | `input` handler: `autoSwitchModel`, `ctx.isIdle()`, matching server in `state.config`, live discovery, and unchanged selection after I/O; for cross-server fallback, the other servers' `registered` entries after `runRefresh` |
