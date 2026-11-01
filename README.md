@@ -12,6 +12,10 @@ A [Pi](https://pi.dev) extension that **auto-detects OpenAI-compatible local LLM
   re-registers to keep it in sync.
 - When a server is killed / unreachable, unregisters its provider so the
   models disappear.
+- If a `localhost` server is hidden by another program on the same port (for
+  example a static file server on the IPv6 loopback), retries `127.0.0.1` and
+  `[::1]` and uses the address that actually serves models. See
+  [Troubleshooting](#troubleshooting).
 - Detects each server's **real running context size** (not a fixed 128k) by
   probing llama-server's `/props` and `/slots` endpoints — see
   [Context window detection](#context-window-detection).
@@ -324,5 +328,14 @@ meaningful there.)
   extension still supplies Pi's required fallback `apiKey: "local"`.
 - **Server is up but models are empty:** open `<baseUrl>/models` in a browser to
   confirm it returns `{ "data": [{ "id": "..." }, ...] }`.
+- **Server works on `127.0.0.1` but not on `localhost`:** another program is
+  probably on the same port on the IPv6 loopback, e.g. a leftover
+  `python -m http.server 8080`, which binds `[::]`. `localhost` tries `::1`
+  first and gets that program instead of your model server. For a `localhost`
+  URL that fails or returns something other than a model list, the extension
+  retries `127.0.0.1` and `[::1]`. It uses whichever one answers, for both
+  discovery and chat, and shows a warning. The provider name doesn't change.
+  To find the other program on Windows, run
+  `Get-NetTCPConnection -LocalPort 8080 -State Listen`.
 - **Startup feels slow:** if all your servers are usually down, set
   `"discoverAtStartup": false` (or lower `"timeoutMs"`).

@@ -42,6 +42,7 @@ test/
   scope.mts                  # provider-name prefixing + settings.json scope mgmt
   servers.mts                # /local-llama-servers add|list|remove against a mock
   switch.mts                 # input recovery, model auto-switch + manual-selection races
+  loopback.mts               # localhost shadowed on ::1 -> 127.0.0.1 fallback
 local-servers.example.json   # documented example config
 package.json                 # declares the extension via "pi.extensions": ["./src/index.ts"]
 tsconfig.json                # noEmit; used only for editor/type checking
@@ -67,6 +68,7 @@ node test/sanity.mts     # also proves a live poll cycle + provider unregister
 node test/scope.mts      # uses an isolated temp PI_CODING_AGENT_DIR
 node test/servers.mts    # uses an isolated temp PI_CODING_AGENT_DIR + mock server
 node test/switch.mts     # isolated; real Pi prompt preflight + registry, fake extension API/agent loop
+node test/loopback.mts   # isolated; IPv6 impostor + IPv4 model server on one port
 ```
 
 **Note:** `test/sanity.mts` does NOT isolate config, so it will also pick up
@@ -268,6 +270,7 @@ certainly the cause, not a bug in this extension.
 | Provider not re-registered after a change | `providerSignature()` (ids + contextWindow + maxTokens). Changing only `name`/`compat` will NOT re-register — by design. |
 | Wrong / 128k context window shown | `discoverServerContext()` / `resolveContextWindow()`. Hit `<baseUrl>/props` and `<baseUrl>/slots` directly; confirm `meta.n_ctx`. `meta.n_ctx_train` is intentionally ignored. |
 | Server up but treated as down | `discoverModels()` error path; `timeoutMs`; `fetchWithTimeout`/`AbortSignal.timeout` |
+| Works on `127.0.0.1`, not `localhost` / registered `baseUrl` is `127.0.0.1` | Another listener on `[::]`/`::1` on the same port (e.g. `python -m http.server`). `discoverModels()` → `loopbackAlternates()` fallback; `RegisteredEntry.baseUrl` |
 | Polling stopped / not running | `session_start` handler; `timer`/`clearInterval`; `config.servers.length` and `pollIntervalMs > 0` gate |
 | Scope pattern not added | `autoScopePattern`, `scopeSettings`, `isProjectTrusted()`, the `if-empty` mode in `ensureScopePattern()` |
 | settings.json corrupted / race | `writeSettingsObject()` (tmp+rename); pi writing concurrently |

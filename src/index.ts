@@ -18,6 +18,10 @@
  *   - When the model list, a model's live context window, OR the key changes,
  *     re-registers to keep the provider up to date.
  *   - When a server is killed / unreachable, unregisters its provider.
+ *   - When a `localhost` URL fails or answers with something that isn't a
+ *     model list (e.g. a static file server on `[::]` shadowing a model
+ *     server on `127.0.0.1`), retries `127.0.0.1` and `[::1]` and registers
+ *     the provider with the address that answered (see loopbackAlternates).
  *   - Detects each server's real running context size (not a fixed 128k) by
  *     probing llama-server's `/props` and `/slots` (see resolveContextWindow).
  *   - Per-server `reasoning`, `maxTokens` and `thinkingLevelMap` options mark
@@ -140,7 +144,6 @@ interface Config {
 }
 
 interface NormalizedServer extends ServerConfig {
-	modelsUrl: string;
 	providerName: string; // always starts with PROVIDER_PREFIX
 	displayName: string;
 }
@@ -150,6 +153,7 @@ interface RegisteredEntry {
 	modelIdsKey: string; // sorted, newline-joined model ids; "" if none
 	signature: string; // ids + contextWindow + maxTokens; change triggers re-register
 	apiKey: string; // compare in memory so key replacement refreshes inference credentials
+	baseUrl: string; // effective URL registered with pi (may be a loopback fallback)
 }
 
 interface RawModel {
@@ -164,6 +168,8 @@ interface RawModel {
 interface DiscoverOk {
 	ok: true;
 	models: RawModel[];
+	baseUrl: string; // URL that actually answered (configured, or a loopback fallback)
+	fallbackFrom?: string; // why the configured URL was not used, when it wasn't
 }
 interface DiscoverFail {
 	ok: false;
@@ -179,6 +185,7 @@ interface RefreshSummary {
 	up: { server: NormalizedServer; count: number }[];
 	down: { server: NormalizedServer; error: string }[];
 	auth: { server: NormalizedServer; kind: "missing" | "rejected" }[];
+	rerouted: { server: NormalizedServer; baseUrl: string; reason: string }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +748,6 @@ function normalizeServer(server: ServerConfig): NormalizedServer {
 
 	return {
 		...server,
-		modelsUrl: `${server.baseUrl}/models`,
 		providerName: toProviderName(server.provider, host),
 		displayName: server.name ?? host,
 	};
@@ -768,36 +774,70 @@ async function fetchWithTimeout(
 	return fetch(url, { ...init, signal: timeoutSignal(timeoutMs) });
 }
 
-async function discoverModels(server: NormalizedServer, timeoutMs: number): Promise<DiscoverResult> {
+async function discoverModelsAt(baseUrl: string, apiKey: string | undefined, timeoutMs: number): Promise<DiscoverResult> {
 	try {
 		const headers: Record<string, string> = { accept: "application/json" };
-		if (server.apiKey) headers.authorization = `Bearer ${server.apiKey}`;
+		if (apiKey) headers.authorization = `Bearer ${apiKey}`;
 
-		const res = await fetchWithTimeout(server.modelsUrl, { method: "GET", headers }, timeoutMs);
+		const res = await fetchWithTimeout(`${baseUrl}/models`, { method: "GET", headers }, timeoutMs);
 		if (!res.ok) return {
 			ok: false,
 			error: `HTTP ${res.status}`,
 			auth: res.status === 401 || res.status === 403
-				? (server.apiKey ? "rejected" : "missing") : undefined,
+				? (apiKey ? "rejected" : "missing") : undefined,
 		};
 
 		const json: unknown = await res.json().catch(() => null);
-		let list: unknown[] = [];
+		let list: unknown[] | undefined;
 		if (Array.isArray(json)) list = json;
 		else if (json && typeof json === "object") {
 			const obj = json as Record<string, unknown>;
 			if (Array.isArray(obj.data)) list = obj.data;
 			else if (Array.isArray(obj.models)) list = obj.models;
 		}
+		// A 2xx that isn't a model list (e.g. an HTML page from some other web
+		// server on the same port) is not an OpenAI-compatible server.
+		if (!list) return { ok: false, error: "response is not an OpenAI-compatible model list" };
 
 		const models = list.filter(
 			(m): m is RawModel =>
 				!!m && typeof m === "object" && (typeof (m as RawModel).id === "string" || typeof (m as RawModel).name === "string"),
 		);
-		return { ok: true, models };
+		return { ok: true, models, baseUrl };
 	} catch (e) {
 		return { ok: false, error: errMsg(e) };
 	}
+}
+
+/**
+ * Explicit loopback addresses to retry when a `localhost` URL fails. Node (and
+ * pi's HTTP client) try `::1` before `127.0.0.1`, so an unrelated process bound
+ * to `[::]:<port>` (e.g. `python -m http.server`) silently shadows a model
+ * server bound only to `127.0.0.1:<port>` — and vice versa.
+ */
+function loopbackAlternates(baseUrl: string): string[] {
+	let url: URL;
+	try {
+		url = new URL(baseUrl);
+	} catch {
+		return [];
+	}
+	if (url.hostname.toLowerCase() !== "localhost") return [];
+	return ["127.0.0.1", "[::1]"].map((host) => {
+		const alt = new URL(url.href);
+		alt.hostname = host;
+		return alt.href.replace(/\/+$/, "");
+	});
+}
+
+async function discoverModels(server: NormalizedServer, timeoutMs: number): Promise<DiscoverResult> {
+	const primary = await discoverModelsAt(server.baseUrl, server.apiKey, timeoutMs);
+	if (primary.ok) return primary;
+	const alternates = loopbackAlternates(server.baseUrl);
+	if (!alternates.length) return primary;
+	const results = await Promise.all(alternates.map((url) => discoverModelsAt(url, server.apiKey, timeoutMs)));
+	const found = results.find((r): r is DiscoverOk => r.ok);
+	return found ? { ...found, fallbackFrom: primary.error } : primary;
 }
 
 /**
@@ -858,12 +898,13 @@ function ctxFromSlots(slots: unknown): number | undefined {
  * without these endpoints) — callers then fall back to per-model fields.
  */
 async function discoverServerContext(
-	server: NormalizedServer,
+	baseUrl: string,
+	apiKey: string | undefined,
 	timeoutMs: number,
 ): Promise<number | undefined> {
-	const fromProps = ctxFromProps(await getJson(`${server.baseUrl}/props`, timeoutMs, server.apiKey));
+	const fromProps = ctxFromProps(await getJson(`${baseUrl}/props`, timeoutMs, apiKey));
 	if (fromProps) return fromProps;
-	return ctxFromSlots(await getJson(`${server.baseUrl}/slots`, timeoutMs, server.apiKey));
+	return ctxFromSlots(await getJson(`${baseUrl}/slots`, timeoutMs, apiKey));
 }
 
 /** Read llama-server's `meta.n_ctx` (running context) from a /v1/models entry. */
@@ -919,10 +960,11 @@ function buildProviderConfig(
 	server: NormalizedServer,
 	models: RawModel[],
 	serverCtx: number | undefined,
+	baseUrl: string = server.baseUrl,
 ) {
 	return {
 		name: server.displayName,
-		baseUrl: server.baseUrl,
+		baseUrl,
 		apiKey: server.apiKey ?? "local", // local servers ignore it, but pi needs *some* auth
 		api: "openai-completions" as const,
 		models: models.map((m) => toModelDefinition(m, server, serverCtx)),
@@ -979,6 +1021,7 @@ async function refresh(
 		up: [],
 		down: [],
 		auth: [],
+		rerouted: [],
 	};
 
 	const keys = await readCredentials();
@@ -988,10 +1031,15 @@ async function refresh(
 			// Fetch the model list and the live server context (llama-server's
 			// /props or /slots) in parallel. serverCtx is best-effort: it is
 			// undefined for servers that don't expose those endpoints.
-			const [result, serverCtx] = await Promise.all([
+			let [result, serverCtx] = await Promise.all([
 				discoverModels(server, config.timeoutMs),
-				discoverServerContext(server, config.timeoutMs),
+				discoverServerContext(server.baseUrl, server.apiKey, config.timeoutMs),
 			]);
+			// The models answered on a loopback fallback: the context probe above
+			// hit whatever is shadowing the configured URL, so ask the real server.
+			if (result.ok && result.baseUrl !== server.baseUrl) {
+				serverCtx = await discoverServerContext(result.baseUrl, server.apiKey, config.timeoutMs);
+			}
 			return { server, result, serverCtx };
 		}),
 	);
@@ -1002,21 +1050,26 @@ async function refresh(
 		seen.add(server.providerName);
 
 		if (result.ok) {
-			const providerConfig = buildProviderConfig(server, result.models, serverCtx);
+			const providerConfig = buildProviderConfig(server, result.models, serverCtx, result.baseUrl);
 			const signature = providerSignature(providerConfig.models);
 			const idsKey = modelIdsKey(result.models);
 			const prev = registered.get(server.providerName);
+			const entry = { server, modelIdsKey: idsKey, signature, apiKey: providerConfig.apiKey, baseUrl: result.baseUrl };
 			if (!prev) {
 				pi.registerProvider(server.providerName, providerConfig);
-				registered.set(server.providerName, { server, modelIdsKey: idsKey, signature, apiKey: providerConfig.apiKey });
+				registered.set(server.providerName, entry);
 				summary.added.push(server);
-			} else if (prev.signature !== signature || prev.apiKey !== providerConfig.apiKey) {
+			} else if (prev.signature !== signature || prev.apiKey !== providerConfig.apiKey || prev.baseUrl !== result.baseUrl) {
 				// Model set OR per-model fields (context window, max tokens)
 				// changed since last poll — re-register to keep pi in sync.
-				// This also covers relaunching llama-server with a different -c.
+				// This also covers relaunching llama-server with a different -c,
+				// and moving to/from a loopback fallback URL.
 				pi.registerProvider(server.providerName, providerConfig);
-				registered.set(server.providerName, { server, modelIdsKey: idsKey, signature, apiKey: providerConfig.apiKey });
+				registered.set(server.providerName, entry);
 				summary.changed.push(server);
+			}
+			if (result.fallbackFrom && prev?.baseUrl !== result.baseUrl) {
+				summary.rerouted.push({ server, baseUrl: result.baseUrl, reason: result.fallbackFrom });
 			}
 			authStates.delete(server.providerName);
 			summary.up.push({ server, count: result.models.length });
@@ -1067,6 +1120,9 @@ function emitNotifications(
 	if (summary.changed.length) {
 		lines.push(`~ updated: ${summary.changed.map((s) => s.displayName).join(", ")}`);
 	}
+	for (const { server, baseUrl, reason } of summary.rerouted) {
+		lines.push(`${server.baseUrl} answered [${reason}] (another program on that port?); using ${baseUrl}`);
+	}
 	if (summary.removed.length) {
 		lines.push(`- unavailable: ${summary.removed.map((r) => `${r.server.displayName} [${r.reason}]`).join(", ")}`);
 	}
@@ -1080,7 +1136,7 @@ function emitNotifications(
 	if (!lines.length) return;
 
 	const message = `local-llama: ${lines.join("  |  ")}`;
-	const type = summary.removed.length || newAuth.length ? "warning" : "info";
+	const type = summary.removed.length || newAuth.length || summary.rerouted.length ? "warning" : "info";
 	ctx.ui.notify(message, type);
 }
 
@@ -1133,7 +1189,11 @@ function emitStartupSummary(
 	const rejected = auth.length - missing;
 	if (missing) bits.push(`${missing} needs API key`);
 	if (rejected) bits.push(`${rejected} key rejected`);
-	ctx.ui.notify(`local-llama: ${bits.join("; ")}`, down.length || auth.length ? "warning" : "info");
+	const rerouted = entries.filter((e) => e.baseUrl !== e.server.baseUrl);
+	for (const e of rerouted) {
+		bits.push(`${e.server.baseUrl} is answered by another program; using ${e.baseUrl}`);
+	}
+	ctx.ui.notify(`local-llama: ${bits.join("; ")}`, down.length || auth.length || rerouted.length ? "warning" : "info");
 }
 
 // ---------------------------------------------------------------------------
